@@ -35,23 +35,27 @@
 //!
 //! [lifecycle rule]: https://cloud.google.com/storage/docs/lifecycle#abort-mpu
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::client::CredentialProvider;
+use crate::gcp::credential::GCSAuthorizer;
+use crate::signer::Signer;
 use crate::{
     multipart::PartId, path::Path, GetOptions, GetResult, ListResult, MultipartId, MultipartUpload,
-    ObjectMeta, ObjectStore, PutOptions, PutResult, Result, UploadPart,
+    ObjectMeta, ObjectStore, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 use async_trait::async_trait;
-use bytes::Bytes;
 use client::GoogleCloudStorageClient;
 use futures::stream::BoxStream;
+use hyper::Method;
+use url::Url;
 
 use crate::client::get::GetClientExt;
 use crate::client::list::ListClientExt;
 use crate::client::parts::Parts;
 use crate::multipart::MultipartStore;
 pub use builder::{GoogleCloudStorageBuilder, GoogleConfigKey};
-pub use credential::GcpCredential;
+pub use credential::{GcpCredential, GcpSigningCredential, ServiceAccountKey};
 
 mod builder;
 mod client;
@@ -61,6 +65,10 @@ const STORE: &str = "GCS";
 
 /// [`CredentialProvider`] for [`GoogleCloudStorage`]
 pub type GcpCredentialProvider = Arc<dyn CredentialProvider<Credential = GcpCredential>>;
+
+/// [`GcpSigningCredential`] for [`GoogleCloudStorage`]
+pub type GcpSigningCredentialProvider =
+    Arc<dyn CredentialProvider<Credential = GcpSigningCredential>>;
 
 /// Interface for [Google Cloud Storage](https://cloud.google.com/storage/).
 #[derive(Debug)]
@@ -83,6 +91,11 @@ impl GoogleCloudStorage {
     pub fn credentials(&self) -> &GcpCredentialProvider {
         &self.client.config().credentials
     }
+
+    /// Returns the [`GcpSigningCredentialProvider`] used by [`GoogleCloudStorage`]
+    pub fn signing_credentials(&self) -> &GcpSigningCredentialProvider {
+        &self.client.config().signing_credentials
+    }
 }
 
 #[derive(Debug)]
@@ -101,14 +114,14 @@ struct UploadState {
 
 #[async_trait]
 impl MultipartUpload for GCSMultipartUpload {
-    fn put_part(&mut self, data: Bytes) -> UploadPart {
+    fn put_part(&mut self, payload: PutPayload) -> UploadPart {
         let idx = self.part_idx;
         self.part_idx += 1;
         let state = Arc::clone(&self.state);
         Box::pin(async move {
             let part = state
                 .client
-                .put_part(&state.path, &state.multipart_id, idx, data)
+                .put_part(&state.path, &state.multipart_id, idx, payload)
                 .await?;
             state.parts.put(idx, part);
             Ok(())
@@ -134,8 +147,13 @@ impl MultipartUpload for GCSMultipartUpload {
 
 #[async_trait]
 impl ObjectStore for GoogleCloudStorage {
-    async fn put_opts(&self, location: &Path, bytes: Bytes, opts: PutOptions) -> Result<PutResult> {
-        self.client.put(location, bytes, opts).await
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        self.client.put(location, payload, opts).await
     }
 
     async fn put_multipart(&self, location: &Path) -> Result<Box<dyn MultipartUpload>> {
@@ -196,9 +214,9 @@ impl MultipartStore for GoogleCloudStorage {
         path: &Path,
         id: &MultipartId,
         part_idx: usize,
-        data: Bytes,
+        payload: PutPayload,
     ) -> Result<PartId> {
-        self.client.put_part(path, id, part_idx, data).await
+        self.client.put_part(path, id, part_idx, payload).await
     }
 
     async fn complete_multipart(
@@ -215,10 +233,37 @@ impl MultipartStore for GoogleCloudStorage {
     }
 }
 
+#[async_trait]
+impl Signer for GoogleCloudStorage {
+    async fn signed_url(&self, method: Method, path: &Path, expires_in: Duration) -> Result<Url> {
+        if expires_in.as_secs() > 604800 {
+            return Err(crate::Error::Generic {
+                store: STORE,
+                source: "Expiration Time can't be longer than 604800 seconds (7 days).".into(),
+            });
+        }
+
+        let config = self.client.config();
+        let path_url = config.path_url(path);
+        let mut url = Url::parse(&path_url).map_err(|e| crate::Error::Generic {
+            store: STORE,
+            source: format!("Unable to parse url {path_url}: {e}").into(),
+        })?;
+
+        let signing_credentials = self.signing_credentials().get_credential().await?;
+        let authorizer = GCSAuthorizer::new(signing_credentials);
+
+        authorizer
+            .sign(method, &mut url, expires_in, &self.client)
+            .await?;
+
+        Ok(url)
+    }
+}
+
 #[cfg(test)]
 mod test {
 
-    use bytes::Bytes;
     use credential::DEFAULT_GCS_BASE_URL;
 
     use crate::tests::*;
@@ -248,6 +293,36 @@ mod test {
             get_opts(&integration).await;
             put_opts(&integration, true).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn gcs_test_sign() {
+        crate::test_util::maybe_skip_integration!();
+        let integration = GoogleCloudStorageBuilder::from_env().build().unwrap();
+
+        let client = reqwest::Client::new();
+
+        let path = Path::from("test_sign");
+        let url = integration
+            .signed_url(Method::PUT, &path, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        println!("PUT {url}");
+
+        let resp = client.put(url).body("data").send().await.unwrap();
+        resp.error_for_status().unwrap();
+
+        let url = integration
+            .signed_url(Method::GET, &path, Duration::from_secs(3600))
+            .await
+            .unwrap();
+        println!("GET {url}");
+
+        let resp = client.get(url).send().await.unwrap();
+        let resp = resp.error_for_status().unwrap();
+        let data = resp.bytes().await.unwrap();
+        assert_eq!(data.as_ref(), b"data");
     }
 
     #[tokio::test]
@@ -319,7 +394,7 @@ mod test {
         let integration = config.with_bucket_name(NON_EXISTENT_NAME).build().unwrap();
 
         let location = Path::from_iter([NON_EXISTENT_NAME]);
-        let data = Bytes::from("arbitrary data");
+        let data = PutPayload::from("arbitrary data");
 
         let err = integration
             .put(&location, data)

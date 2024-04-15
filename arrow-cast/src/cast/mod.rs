@@ -40,9 +40,11 @@
 mod decimal;
 mod dictionary;
 mod list;
+mod string;
 use crate::cast::decimal::*;
 use crate::cast::dictionary::*;
 use crate::cast::list::*;
+use crate::cast::string::*;
 
 use chrono::{NaiveTime, Offset, TimeZone, Utc};
 use std::cmp::Ordering;
@@ -515,6 +517,34 @@ fn as_time_res_with_timezone<T: ArrowPrimitiveType>(
             v
         ))
     })
+}
+
+fn timestamp_to_date32<T: ArrowTimestampType>(
+    array: &PrimitiveArray<T>,
+) -> Result<ArrayRef, ArrowError> {
+    let err = |x: i64| {
+        ArrowError::CastError(format!(
+            "Cannot convert {} {x} to datetime",
+            std::any::type_name::<T>()
+        ))
+    };
+
+    let array: Date32Array = match array.timezone() {
+        Some(tz) => {
+            let tz: Tz = tz.parse()?;
+            array.try_unary(|x| {
+                as_datetime_with_timezone::<T>(x, tz)
+                    .ok_or_else(|| err(x))
+                    .map(|d| Date32Type::from_naive_date(d.date_naive()))
+            })?
+        }
+        None => array.try_unary(|x| {
+            as_datetime::<T>(x)
+                .ok_or_else(|| err(x))
+                .map(|d| Date32Type::from_naive_date(d.date()))
+        })?,
+    };
+    Ok(Arc::new(array))
 }
 
 /// Cast `array` to the provided data type and return a new Array with type `to_type`, if possible.
@@ -1588,24 +1618,17 @@ pub fn cast_with_options(
                 to_tz.clone(),
             ))
         }
-        (Timestamp(from_unit, _), Date32) => {
-            let array = cast_with_options(array, &Int64, cast_options)?;
-            let time_array = array.as_primitive::<Int64Type>();
-            let from_size = time_unit_multiple(from_unit) * SECONDS_IN_DAY;
-
-            let mut b = Date32Builder::with_capacity(array.len());
-
-            for i in 0..array.len() {
-                if time_array.is_null(i) {
-                    b.append_null();
-                } else {
-                    b.append_value(
-                        num::integer::div_floor::<i64>(time_array.value(i), from_size) as i32,
-                    );
-                }
-            }
-
-            Ok(Arc::new(b.finish()) as ArrayRef)
+        (Timestamp(TimeUnit::Microsecond, _), Date32) => {
+            timestamp_to_date32(array.as_primitive::<TimestampMicrosecondType>())
+        }
+        (Timestamp(TimeUnit::Millisecond, _), Date32) => {
+            timestamp_to_date32(array.as_primitive::<TimestampMillisecondType>())
+        }
+        (Timestamp(TimeUnit::Second, _), Date32) => {
+            timestamp_to_date32(array.as_primitive::<TimestampSecondType>())
+        }
+        (Timestamp(TimeUnit::Nanosecond, _), Date32) => {
+            timestamp_to_date32(array.as_primitive::<TimestampNanosecondType>())
         }
         (Timestamp(TimeUnit::Second, _), Date64) => Ok(Arc::new(match cast_options.safe {
             true => {
@@ -2001,26 +2024,6 @@ where
     from.unary_opt::<_, R>(num::cast::cast::<T::Native, R::Native>)
 }
 
-fn value_to_string<O: OffsetSizeTrait>(
-    array: &dyn Array,
-    options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    let mut builder = GenericStringBuilder::<O>::new();
-    let formatter = ArrayFormatter::try_new(array, &options.format_options)?;
-    let nulls = array.nulls();
-    for i in 0..array.len() {
-        match nulls.map(|x| x.is_null(i)).unwrap_or_default() {
-            true => builder.append_null(),
-            false => {
-                formatter.value(i).write(&mut builder)?;
-                // tell the builder the row is finished
-                builder.append_value("");
-            }
-        }
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
 fn cast_numeric_to_binary<FROM: ArrowPrimitiveType, O: OffsetSizeTrait>(
     array: &dyn Array,
 ) -> Result<ArrayRef, ArrowError> {
@@ -2032,172 +2035,6 @@ fn cast_numeric_to_binary<FROM: ArrowPrimitiveType, O: OffsetSizeTrait>(
         array.values().inner().clone(),
         array.nulls().cloned(),
     )))
-}
-
-/// Parse UTF-8
-fn parse_string<P: Parser, O: OffsetSizeTrait>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    let string_array = array.as_string::<O>();
-    let array = if cast_options.safe {
-        let iter = string_array.iter().map(|x| x.and_then(P::parse));
-
-        // Benefit:
-        //     20% performance improvement
-        // Soundness:
-        //     The iterator is trustedLen because it comes from an `StringArray`.
-        unsafe { PrimitiveArray::<P>::from_trusted_len_iter(iter) }
-    } else {
-        let v = string_array
-            .iter()
-            .map(|x| match x {
-                Some(v) => P::parse(v).ok_or_else(|| {
-                    ArrowError::CastError(format!(
-                        "Cannot cast string '{}' to value of {:?} type",
-                        v,
-                        P::DATA_TYPE
-                    ))
-                }),
-                None => Ok(P::Native::default()),
-            })
-            .collect::<Result<Vec<_>, ArrowError>>()?;
-        PrimitiveArray::new(v.into(), string_array.nulls().cloned())
-    };
-
-    Ok(Arc::new(array) as ArrayRef)
-}
-
-/// Casts generic string arrays to an ArrowTimestampType (TimeStampNanosecondArray, etc.)
-fn cast_string_to_timestamp<O: OffsetSizeTrait, T: ArrowTimestampType>(
-    array: &dyn Array,
-    to_tz: &Option<Arc<str>>,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    let array = array.as_string::<O>();
-    let out: PrimitiveArray<T> = match to_tz {
-        Some(tz) => {
-            let tz: Tz = tz.as_ref().parse()?;
-            cast_string_to_timestamp_impl(array, &tz, cast_options)?
-        }
-        None => cast_string_to_timestamp_impl(array, &Utc, cast_options)?,
-    };
-    Ok(Arc::new(out.with_timezone_opt(to_tz.clone())))
-}
-
-fn cast_string_to_timestamp_impl<O: OffsetSizeTrait, T: ArrowTimestampType, Tz: TimeZone>(
-    array: &GenericStringArray<O>,
-    tz: &Tz,
-    cast_options: &CastOptions,
-) -> Result<PrimitiveArray<T>, ArrowError> {
-    if cast_options.safe {
-        let iter = array.iter().map(|v| {
-            v.and_then(|v| {
-                let naive = string_to_datetime(tz, v).ok()?.naive_utc();
-                T::make_value(naive)
-            })
-        });
-        // Benefit:
-        //     20% performance improvement
-        // Soundness:
-        //     The iterator is trustedLen because it comes from an `StringArray`.
-
-        Ok(unsafe { PrimitiveArray::from_trusted_len_iter(iter) })
-    } else {
-        let vec = array
-            .iter()
-            .map(|v| {
-                v.map(|v| {
-                    let naive = string_to_datetime(tz, v)?.naive_utc();
-                    T::make_value(naive).ok_or_else(|| {
-                        ArrowError::CastError(format!(
-                            "Overflow converting {naive} to {:?}",
-                            T::UNIT
-                        ))
-                    })
-                })
-                .transpose()
-            })
-            .collect::<Result<Vec<Option<i64>>, _>>()?;
-
-        // Benefit:
-        //     20% performance improvement
-        // Soundness:
-        //     The iterator is trustedLen because it comes from an `StringArray`.
-        Ok(unsafe { PrimitiveArray::from_trusted_len_iter(vec.iter()) })
-    }
-}
-
-fn cast_string_to_interval<Offset, F, ArrowType>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-    parse_function: F,
-) -> Result<ArrayRef, ArrowError>
-where
-    Offset: OffsetSizeTrait,
-    ArrowType: ArrowPrimitiveType,
-    F: Fn(&str) -> Result<ArrowType::Native, ArrowError> + Copy,
-{
-    let string_array = array
-        .as_any()
-        .downcast_ref::<GenericStringArray<Offset>>()
-        .unwrap();
-    let interval_array = if cast_options.safe {
-        let iter = string_array
-            .iter()
-            .map(|v| v.and_then(|v| parse_function(v).ok()));
-
-        // Benefit:
-        //     20% performance improvement
-        // Soundness:
-        //     The iterator is trustedLen because it comes from an `StringArray`.
-        unsafe { PrimitiveArray::<ArrowType>::from_trusted_len_iter(iter) }
-    } else {
-        let vec = string_array
-            .iter()
-            .map(|v| v.map(parse_function).transpose())
-            .collect::<Result<Vec<_>, ArrowError>>()?;
-
-        // Benefit:
-        //     20% performance improvement
-        // Soundness:
-        //     The iterator is trustedLen because it comes from an `StringArray`.
-        unsafe { PrimitiveArray::<ArrowType>::from_trusted_len_iter(vec) }
-    };
-    Ok(Arc::new(interval_array) as ArrayRef)
-}
-
-fn cast_string_to_year_month_interval<Offset: OffsetSizeTrait>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    cast_string_to_interval::<Offset, _, IntervalYearMonthType>(
-        array,
-        cast_options,
-        parse_interval_year_month,
-    )
-}
-
-fn cast_string_to_day_time_interval<Offset: OffsetSizeTrait>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    cast_string_to_interval::<Offset, _, IntervalDayTimeType>(
-        array,
-        cast_options,
-        parse_interval_day_time,
-    )
-}
-
-fn cast_string_to_month_day_nano_interval<Offset: OffsetSizeTrait>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    cast_string_to_interval::<Offset, _, IntervalMonthDayNanoType>(
-        array,
-        cast_options,
-        parse_interval_month_day_nano,
-    )
 }
 
 fn adjust_timestamp_to_timezone<T: ArrowTimestampType>(
@@ -2220,41 +2057,6 @@ fn adjust_timestamp_to_timezone<T: ArrowTimestampType>(
         })?
     };
     Ok(adjusted)
-}
-
-/// Casts Utf8 to Boolean
-fn cast_utf8_to_boolean<OffsetSize>(
-    from: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError>
-where
-    OffsetSize: OffsetSizeTrait,
-{
-    let array = from
-        .as_any()
-        .downcast_ref::<GenericStringArray<OffsetSize>>()
-        .unwrap();
-
-    let output_array = array
-        .iter()
-        .map(|value| match value {
-            Some(value) => match value.to_ascii_lowercase().trim() {
-                "t" | "tr" | "tru" | "true" | "y" | "ye" | "yes" | "on" | "1" => Ok(Some(true)),
-                "f" | "fa" | "fal" | "fals" | "false" | "n" | "no" | "of" | "off" | "0" => {
-                    Ok(Some(false))
-                }
-                invalid_value => match cast_options.safe {
-                    true => Ok(None),
-                    false => Err(ArrowError::CastError(format!(
-                        "Cannot cast value '{invalid_value}' to value of Boolean type",
-                    ))),
-                },
-            },
-            None => Ok(None),
-        })
-        .collect::<Result<BooleanArray, _>>()?;
-
-    Ok(Arc::new(output_array))
 }
 
 /// Cast numeric types to Boolean
@@ -2323,37 +2125,6 @@ where
     // Soundness:
     //     The iterator is trustedLen because it comes from a Range
     unsafe { PrimitiveArray::<T>::from_trusted_len_iter(iter) }
-}
-
-/// A specified helper to cast from `GenericBinaryArray` to `GenericStringArray` when they have same
-/// offset size so re-encoding offset is unnecessary.
-fn cast_binary_to_string<O: OffsetSizeTrait>(
-    array: &dyn Array,
-    cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    let array = array
-        .as_any()
-        .downcast_ref::<GenericByteArray<GenericBinaryType<O>>>()
-        .unwrap();
-
-    match GenericStringArray::<O>::try_from_binary(array.clone()) {
-        Ok(a) => Ok(Arc::new(a)),
-        Err(e) => match cast_options.safe {
-            true => {
-                // Fallback to slow method to convert invalid sequences to nulls
-                let mut builder =
-                    GenericStringBuilder::<O>::with_capacity(array.len(), array.value_data().len());
-
-                let iter = array
-                    .iter()
-                    .map(|v| v.and_then(|v| std::str::from_utf8(v).ok()));
-
-                builder.extend(iter);
-                Ok(Arc::new(builder.finish()))
-            }
-            false => Err(e),
-        },
-    }
 }
 
 /// Helper function to cast from one `BinaryArray` or 'LargeBinaryArray' to 'FixedSizeBinaryArray'.
@@ -2470,6 +2241,7 @@ where
 #[cfg(test)]
 mod tests {
     use arrow_buffer::{Buffer, NullBuffer};
+    use chrono::NaiveDate;
     use half::f16;
 
     use super::*;
@@ -4684,14 +4456,33 @@ mod tests {
     fn test_cast_timestamp_to_date32() {
         let array =
             TimestampMillisecondArray::from(vec![Some(864000000005), Some(1545696000001), None])
-                .with_timezone("UTC".to_string());
+                .with_timezone("+00:00".to_string());
         let b = cast(&array, &DataType::Date32).unwrap();
         let c = b.as_primitive::<Date32Type>();
         assert_eq!(10000, c.value(0));
         assert_eq!(17890, c.value(1));
         assert!(c.is_null(2));
     }
+    #[test]
+    fn test_cast_timestamp_to_date32_zone() {
+        let strings = StringArray::from_iter([
+            Some("1970-01-01T00:00:01"),
+            Some("1970-01-01T23:59:59"),
+            None,
+            Some("2020-03-01T02:00:23+00:00"),
+        ]);
+        let dt = DataType::Timestamp(TimeUnit::Millisecond, Some("-07:00".into()));
+        let timestamps = cast(&strings, &dt).unwrap();
+        let dates = cast(timestamps.as_ref(), &DataType::Date32).unwrap();
 
+        let c = dates.as_primitive::<Date32Type>();
+        let expected = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        assert_eq!(c.value_as_date(0).unwrap(), expected);
+        assert_eq!(c.value_as_date(1).unwrap(), expected);
+        assert!(c.is_null(2));
+        let expected = NaiveDate::from_ymd_opt(2020, 2, 29).unwrap();
+        assert_eq!(c.value_as_date(3).unwrap(), expected);
+    }
     #[test]
     fn test_cast_timestamp_to_date64() {
         let array =
@@ -7015,6 +6806,27 @@ mod tests {
             3,
         )) as ArrayRef;
         assert_eq!(expected.as_ref(), res.as_ref());
+
+        // The safe option is false and the source array contains a null list.
+        // issue: https://github.com/apache/arrow-rs/issues/5642
+        let array = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2), Some(3)]),
+            None,
+        ])) as ArrayRef;
+        let res = cast_with_options(
+            array.as_ref(),
+            &DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 3),
+            &CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let expected = Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+            vec![Some(vec![Some(1), Some(2), Some(3)]), None],
+            3,
+        )) as ArrayRef;
+        assert_eq!(expected.as_ref(), res.as_ref());
     }
 
     #[test]
@@ -8631,7 +8443,7 @@ mod tests {
             .map(|ts| ts / 1_000_000)
             .collect::<Vec<_>>();
 
-        let array = TimestampMillisecondArray::from(ts_array).with_timezone("UTC".to_string());
+        let array = TimestampMillisecondArray::from(ts_array).with_timezone("+00:00".to_string());
         let casted_array = cast(&array, &DataType::Date32).unwrap();
         let date_array = casted_array.as_primitive::<Date32Type>();
         let casted_array = cast(&date_array, &DataType::Utf8).unwrap();
@@ -8723,7 +8535,9 @@ mod tests {
 
         for dt in data_types {
             assert_eq!(
-                cast_with_options(&array, &dt, &cast_options).unwrap_err().to_string(),
+                cast_with_options(&array, &dt, &cast_options)
+                    .unwrap_err()
+                    .to_string(),
                 "Parser error: Invalid timezone \"ZZTOP\": only offset based timezones supported without chrono-tz feature"
             );
         }

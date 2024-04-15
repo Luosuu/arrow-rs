@@ -19,7 +19,7 @@ use crate::aws::{AwsCredentialProvider, STORE, STRICT_ENCODE_SET, STRICT_PATH_EN
 use crate::client::retry::RetryExt;
 use crate::client::token::{TemporaryToken, TokenCache};
 use crate::client::TokenProvider;
-use crate::util::hmac_sha256;
+use crate::util::{hex_digest, hex_encode, hmac_sha256};
 use crate::{CredentialProvider, Result, RetryConfig};
 use async_trait::async_trait;
 use bytes::Buf;
@@ -342,23 +342,6 @@ impl CredentialExt for RequestBuilder {
     }
 }
 
-/// Computes the SHA256 digest of `body` returned as a hex encoded string
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    hex_encode(digest.as_ref())
-}
-
-/// Returns `bytes` as a lower-case hex encoded string
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        // String writing is infallible
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 /// Canonicalizes query parameters into the AWS canonical form
 ///
 /// <https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html>
@@ -534,7 +517,9 @@ async fn instance_creds(
     let token_result = client
         .request(Method::PUT, token_url)
         .header("X-aws-ec2-metadata-token-ttl-seconds", "600") // 10 minute TTL
-        .send_retry(retry_config)
+        .retryable(retry_config)
+        .idempotent(true)
+        .send()
         .await;
 
     let token = match token_result {
@@ -624,7 +609,9 @@ async fn web_identity(
             ("Version", "2011-06-15"),
             ("WebIdentityToken", &token),
         ])
-        .send_retry(retry_config)
+        .retryable(retry_config)
+        .idempotent(true)
+        .send()
         .await?
         .bytes()
         .await?;

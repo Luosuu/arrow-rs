@@ -24,19 +24,23 @@ use crate::client::s3::{
     ListResponse,
 };
 use crate::client::GetOptionsExt;
-use crate::gcp::{GcpCredential, GcpCredentialProvider, STORE};
+use crate::gcp::{GcpCredential, GcpCredentialProvider, GcpSigningCredentialProvider, STORE};
 use crate::multipart::PartId;
 use crate::path::{Path, DELIMITER};
+use crate::util::hex_encode;
 use crate::{
-    ClientOptions, GetOptions, ListResult, MultipartId, PutMode, PutOptions, PutResult, Result,
-    RetryConfig,
+    ClientOptions, GetOptions, ListResult, MultipartId, PutMode, PutOptions, PutPayload, PutResult,
+    Result, RetryConfig,
 };
 use async_trait::async_trait;
-use bytes::{Buf, Bytes};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use bytes::Buf;
+use hyper::header::CONTENT_LENGTH;
 use percent_encoding::{percent_encode, utf8_percent_encode, NON_ALPHANUMERIC};
 use reqwest::header::HeaderName;
 use reqwest::{header, Client, Method, RequestBuilder, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::sync::Arc;
 
@@ -101,6 +105,15 @@ enum Error {
 
     #[snafu(display("Got invalid multipart response: {}", source))]
     InvalidMultipartResponse { source: quick_xml::de::DeError },
+
+    #[snafu(display("Error signing blob: {}", source))]
+    SignBlobRequest { source: crate::client::retry::Error },
+
+    #[snafu(display("Got invalid signing blob response: {}", source))]
+    InvalidSignBlobResponse { source: reqwest::Error },
+
+    #[snafu(display("Got invalid signing blob signature: {}", source))]
+    InvalidSignBlobSignature { source: base64::DecodeError },
 }
 
 impl From<Error> for crate::Error {
@@ -123,6 +136,8 @@ pub struct GoogleCloudStorageConfig {
 
     pub credentials: GcpCredentialProvider,
 
+    pub signing_credentials: GcpSigningCredentialProvider,
+
     pub bucket_name: String,
 
     pub retry_config: RetryConfig,
@@ -130,11 +145,37 @@ pub struct GoogleCloudStorageConfig {
     pub client_options: ClientOptions,
 }
 
+impl GoogleCloudStorageConfig {
+    pub fn new(
+        base_url: String,
+        credentials: GcpCredentialProvider,
+        signing_credentials: GcpSigningCredentialProvider,
+        bucket_name: String,
+        retry_config: RetryConfig,
+        client_options: ClientOptions,
+    ) -> Self {
+        Self {
+            base_url,
+            credentials,
+            signing_credentials,
+            bucket_name,
+            retry_config,
+            client_options,
+        }
+    }
+
+    pub fn path_url(&self, path: &Path) -> String {
+        format!("{}/{}/{}", self.base_url, self.bucket_name, path)
+    }
+}
+
 /// A builder for a put request allowing customisation of the headers and query string
 pub struct PutRequest<'a> {
     path: &'a Path,
     config: &'a GoogleCloudStorageConfig,
+    payload: PutPayload,
     builder: RequestBuilder,
+    idempotent: bool,
 }
 
 impl<'a> PutRequest<'a> {
@@ -148,12 +189,21 @@ impl<'a> PutRequest<'a> {
         Self { builder, ..self }
     }
 
+    fn set_idempotent(mut self, idempotent: bool) -> Self {
+        self.idempotent = idempotent;
+        self
+    }
+
     async fn send(self) -> Result<PutResult> {
         let credential = self.config.credentials.get_credential().await?;
         let response = self
             .builder
             .bearer_auth(&credential.bearer)
-            .send_retry(&self.config.retry_config)
+            .header(CONTENT_LENGTH, self.payload.content_length())
+            .retryable(&self.config.retry_config)
+            .idempotent(self.idempotent)
+            .payload(Some(self.payload))
+            .send()
             .await
             .context(PutRequestSnafu {
                 path: self.path.as_ref(),
@@ -161,6 +211,21 @@ impl<'a> PutRequest<'a> {
 
         Ok(get_put_result(response.headers(), VERSION_HEADER).context(MetadataSnafu)?)
     }
+}
+
+/// Sign Blob Request Body
+#[derive(Debug, Serialize)]
+struct SignBlobBody {
+    /// The payload to sign
+    payload: String,
+}
+
+/// Sign Blob Response
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignBlobResponse {
+    /// The signature for the payload
+    signed_blob: String,
 }
 
 #[derive(Debug)]
@@ -197,6 +262,56 @@ impl GoogleCloudStorageClient {
         self.config.credentials.get_credential().await
     }
 
+    /// Create a signature from a string-to-sign using Google Cloud signBlob method.
+    /// form like:
+    /// ```plaintext
+    /// curl -X POST --data-binary @JSON_FILE_NAME \
+    /// -H "Authorization: Bearer OAUTH2_TOKEN" \
+    /// -H "Content-Type: application/json" \
+    /// "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/SERVICE_ACCOUNT_EMAIL:signBlob"
+    /// ```
+    ///
+    /// 'JSON_FILE_NAME' is a file containing the following JSON object:
+    /// ```plaintext
+    /// {
+    ///  "payload": "REQUEST_INFORMATION"
+    /// }
+    /// ```
+    pub async fn sign_blob(&self, string_to_sign: &str, client_email: &str) -> Result<String> {
+        let credential = self.get_credential().await?;
+        let body = SignBlobBody {
+            payload: BASE64_STANDARD.encode(string_to_sign),
+        };
+
+        let url = format!(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:signBlob",
+            client_email
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&credential.bearer)
+            .json(&body)
+            .retryable(&self.config.retry_config)
+            .idempotent(true)
+            .send()
+            .await
+            .context(SignBlobRequestSnafu)?;
+
+        //If successful, the signature is returned in the signedBlob field in the response.
+        let response = response
+            .json::<SignBlobResponse>()
+            .await
+            .context(InvalidSignBlobResponseSnafu)?;
+
+        let signed_blob = BASE64_STANDARD
+            .decode(response.signed_blob)
+            .context(InvalidSignBlobSignatureSnafu)?;
+
+        Ok(hex_encode(&signed_blob))
+    }
+
     pub fn object_url(&self, path: &Path) -> String {
         let encoded = utf8_percent_encode(path.as_ref(), NON_ALPHANUMERIC);
         format!(
@@ -208,7 +323,7 @@ impl GoogleCloudStorageClient {
     /// Perform a put request <https://cloud.google.com/storage/docs/xml-api/put-object-upload>
     ///
     /// Returns the new ETag
-    pub fn put_request<'a>(&'a self, path: &'a Path, payload: Bytes) -> PutRequest<'a> {
+    pub fn put_request<'a>(&'a self, path: &'a Path, payload: PutPayload) -> PutRequest<'a> {
         let url = self.object_url(path);
 
         let content_type = self
@@ -220,22 +335,27 @@ impl GoogleCloudStorageClient {
         let builder = self
             .client
             .request(Method::PUT, url)
-            .header(header::CONTENT_TYPE, content_type)
-            .header(header::CONTENT_LENGTH, payload.len())
-            .body(payload);
+            .header(header::CONTENT_TYPE, content_type);
 
         PutRequest {
             path,
             builder,
+            payload,
             config: &self.config,
+            idempotent: false,
         }
     }
 
-    pub async fn put(&self, path: &Path, data: Bytes, opts: PutOptions) -> Result<PutResult> {
-        let builder = self.put_request(path, data);
+    pub async fn put(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        let builder = self.put_request(path, payload);
 
         let builder = match &opts.mode {
-            PutMode::Overwrite => builder,
+            PutMode::Overwrite => builder.set_idempotent(true),
             PutMode::Create => builder.header(&VERSION_MATCH, "0"),
             PutMode::Update(v) => {
                 let etag = v.version.as_ref().context(MissingVersionSnafu)?;
@@ -259,13 +379,18 @@ impl GoogleCloudStorageClient {
         path: &Path,
         upload_id: &MultipartId,
         part_idx: usize,
-        data: Bytes,
+        data: PutPayload,
     ) -> Result<PartId> {
         let query = &[
             ("partNumber", &format!("{}", part_idx + 1)),
             ("uploadId", upload_id),
         ];
-        let result = self.put_request(path, data).query(query).send().await?;
+        let result = self
+            .put_request(path, data)
+            .query(query)
+            .set_idempotent(true)
+            .send()
+            .await?;
 
         Ok(PartId {
             content_id: result.e_tag.unwrap(),
@@ -290,7 +415,9 @@ impl GoogleCloudStorageClient {
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, "0")
             .query(&[("uploads", "")])
-            .send_retry(&self.config.retry_config)
+            .retryable(&self.config.retry_config)
+            .idempotent(true)
+            .send()
             .await
             .context(PutRequestSnafu {
                 path: path.as_ref(),
@@ -329,6 +456,17 @@ impl GoogleCloudStorageClient {
         multipart_id: &MultipartId,
         completed_parts: Vec<PartId>,
     ) -> Result<PutResult> {
+        if completed_parts.is_empty() {
+            // GCS doesn't allow empty multipart uploads
+            let result = self
+                .put_request(path, Default::default())
+                .set_idempotent(true)
+                .send()
+                .await?;
+            self.multipart_cleanup(path, multipart_id).await?;
+            return Ok(result);
+        }
+
         let upload_id = multipart_id.clone();
         let url = self.object_url(path);
 
@@ -348,7 +486,9 @@ impl GoogleCloudStorageClient {
             .bearer_auth(&credential.bearer)
             .query(&[("uploadId", upload_id)])
             .body(data)
-            .send_retry(&self.config.retry_config)
+            .retryable(&self.config.retry_config)
+            .idempotent(true)
+            .send()
             .await
             .context(CompleteMultipartRequestSnafu)?;
 
@@ -406,8 +546,10 @@ impl GoogleCloudStorageClient {
             .bearer_auth(&credential.bearer)
             // Needed if reqwest is compiled with native-tls instead of rustls-tls
             // See https://github.com/apache/arrow-rs/pull/3921
-            .header(header::CONTENT_LENGTH, 0)
-            .send_retry(&self.config.retry_config)
+            .header(CONTENT_LENGTH, 0)
+            .retryable(&self.config.retry_config)
+            .idempotent(!if_not_exists)
+            .send()
             .await
             .map_err(|err| match err.status() {
                 Some(StatusCode::PRECONDITION_FAILED) => crate::Error::AlreadyExists {
