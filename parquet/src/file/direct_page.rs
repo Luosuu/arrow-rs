@@ -21,7 +21,8 @@ pub fn get_page(
     let file_reader = SerializedFileReader::new(file_clone).unwrap();
     let row_group_reader = file_reader.get_row_group(row_group_idx)?;
     // the iterative page reader for one column
-    let page_reader = row_group_reader.get_column_page_reader(column_idx).unwrap();
+    // let _page_reader = row_group_reader.get_column_page_reader(column_idx).unwrap();
+
     // Get the page location for the specified column and page index
     let page_locations = read_pages_locations(&file, row_group_reader.metadata().columns())?;
     let page_location = &page_locations[column_idx][page_idx];
@@ -53,12 +54,12 @@ mod tests {
     use crate::basic::PageType;
     use crate::file::direct_page::get_page;
     use crate::util::test_common::file_util::get_test_file;
-
+    #[test]
     fn test_direct_access_page(){
         let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
 
         let page = get_page(test_file, 0, 0,0).unwrap();
 
-        assert_eq!(page.unwrap().page_type(), PageType::DATA_PAGE_V2);
+        assert_eq!(page.unwrap().page_type(), PageType::DATA_PAGE);
     }
 }
