@@ -18,7 +18,8 @@ use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
 pub fn get_file_page_locations(
     file: File
 ) -> Result<Option<Vec<Vec<Vec<PageLocation>>>>> {
-    let file_reader = SerializedFileReader::new(file).unwrap();
+    let file_clone = file.try_clone().unwrap();
+    let file_reader = SerializedFileReader::new(file_clone).unwrap();
     let num_row_groups = file_reader.num_row_groups();
     let mut file_page_locations = Vec::new();
     for row_group_idx in 0..num_row_groups {
@@ -53,7 +54,7 @@ pub fn generate_random_page_indices_file_level(
         let page_idx = page_random_index - page_num_offsets[row_group_idx];
         random_rg_page_indices_pairs.push((row_group_idx, page_idx));
     }
-    Ok(random_rg_page_indices_pairs)
+    Ok(random_rg_page_indices_pairs) // 2-dim, (row_group_idx, page_idx)
 }
 
 
@@ -152,16 +153,6 @@ pub fn get_page_by_idx(
 
     let column_meta = row_group_reader.metadata().column(column_idx);
     let page = get_page_by_location(file, page_location.clone(), column_meta);
-    // let physical_type = meta.column_type();
-    // let props = Arc::new(ReaderProperties::builder().build());
-    // let decompressor = &mut create_codec(meta.compression(), props.codec_options())?;
-    //
-    // let page = decode_page(
-    //     page_header,
-    //     bytes,
-    //     physical_type,
-    //     decompressor.as_mut(),
-    // )?;
 
     page
 }
@@ -169,15 +160,89 @@ pub fn get_page_by_idx(
 #[cfg(test)]
 mod tests {
     use crate::basic::PageType;
-    use crate::file::direct_page::get_page_by_idx;
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx};
+    use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
     #[test]
-    fn test_direct_access_page(){
+    fn test_direct_access_page_by_idx(){
         let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
 
-        let page = get_page_by_idx(test_file, 0, 0,0).unwrap();
+        let page = get_page_by_idx(test_file, 0, 0,0).unwrap().unwrap();
 
-        assert_eq!(page.unwrap().page_type(), PageType::DATA_PAGE);
+        assert_eq!(page.page_type(), PageType::DATA_PAGE);
+    }
+
+    #[test]
+    fn test_correctness_of_locations_row_group_num(){
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let file_reader = SerializedFileReader::new(test_file.try_clone().unwrap()).unwrap();
+        let row_group_num_from_reader = file_reader.num_row_groups();
+        println!("row group num from file reader: {row_group_num_from_reader}"); // 1
+        let page_locations = get_file_page_locations(test_file.try_clone().unwrap()).unwrap();
+        let row_group_num_from_locations = page_locations.unwrap().len();
+        println!("row group num from location array: {row_group_num_from_locations}");
+
+        assert_eq!(row_group_num_from_locations, row_group_num_from_reader);
+
+    }
+
+    #[test]
+    fn test_file_page_num(){
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let page_locations = get_file_page_locations(test_file.try_clone().unwrap()).unwrap().unwrap();
+        let page_num = page_locations[0].len();
+        println!("the first row group contains {page_num} pages."); // 13
+        assert_ne!(page_num, 0);
+    }
+
+    #[test]
+    fn test_correctness_of_locations_array_shuffle(){
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let file_locations = get_file_page_locations(test_file.try_clone().unwrap()).unwrap().unwrap();
+        let column_idx = 0;
+        let shuffled_indices = generate_random_page_indices_file_level(
+            file_locations,
+            column_idx
+        ).unwrap();
+
+        let page = get_page_by_idx(
+            test_file,
+            shuffled_indices[0].0,
+            column_idx,
+            shuffled_indices[0].1
+        ).unwrap().unwrap();
+
+        assert_eq!(page.page_type(), PageType::DATA_PAGE);
+    }
+
+    #[test]
+    fn test_correctness_dataset_locations_shuffle(){
+        let test_file_0 = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let test_file_1 = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let test_file_2 = get_test_file("alltypes_tiny_pages_plain.parquet");
+
+        let file_locations_0 = get_file_page_locations(test_file_0.try_clone().unwrap()).unwrap().unwrap();
+        let file_locations_1 = get_file_page_locations(test_file_1.try_clone().unwrap()).unwrap().unwrap();
+        let file_locations_2 = get_file_page_locations(test_file_2.try_clone().unwrap()).unwrap().unwrap();
+
+        let mut dataset_locations = Vec::new();
+        dataset_locations.push(file_locations_0);
+        dataset_locations.push(file_locations_1);
+        dataset_locations.push(file_locations_2);
+
+        let column_idx = 0;
+
+        let random_indices = generate_random_page_indices_dataset_level(dataset_locations,column_idx).unwrap();
+
+        let file_to_read = match random_indices[0].0 {
+            0 => test_file_0,
+            1 => test_file_1,
+            2 => test_file_2,
+            _ => panic!()
+        };
+
+        let page = get_page_by_idx(file_to_read, random_indices[0].1, column_idx, random_indices[0].2).unwrap().unwrap();
+        assert_eq!(page.page_type(), PageType::DATA_PAGE);
     }
 }
