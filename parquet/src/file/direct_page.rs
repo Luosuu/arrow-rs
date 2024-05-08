@@ -4,7 +4,13 @@ use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use rand::seq::SliceRandom;
 
+use arrow_array::RecordBatch;
+use arrow_schema::DataType;
+
+use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
+use crate::arrow::parquet_to_arrow_schema;
 use crate::column::page::{Page, PageReader};
+use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::compression::{Codec, create_codec};
 use crate::errors::Result;
 use crate::file::metadata::ColumnChunkMetaData;
@@ -157,10 +163,103 @@ pub fn get_page_by_idx(
     page
 }
 
+/// maybe record_reader instead of low-level ByteArray decoder should be used here.
+pub fn read_page_into_batch(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_idx: usize
+)-> Result<Option<RecordBatch>> {
+
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    // Get the column descriptor for the desired column (assuming column index 0)
+    let column_desc= parquet_metadata.file_metadata().schema_descr_ptr().column(column_idx);
+
+    // Get the page for the desired column chunk and page index
+    let page: Page = match get_page_by_idx(file, row_group_idx, column_idx, page_idx) {
+        Ok(Some(page)) => page,
+        Ok(None) => {
+            log::warn!("No page found for row group {}, column {}, page {}", row_group_idx, column_idx, page_idx);
+            return Ok(None);
+        }
+        Err(e) => {
+            log::error!("Error retrieving page: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    let bytes = match page.buffer().get_bytes(0, page.buffer().len()) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Error getting bytes from page buffer: {:?}", e);
+            return Err(e);
+        }
+    };
+
+    // Create a ByteArrayColumnValueDecoder for the column
+    let mut decoder: ByteArrayColumnValueDecoder<i32> = ByteArrayColumnValueDecoder::new(&column_desc);
+    let max_def_level = column_desc.max_def_level();
+    let num_levels = if max_def_level > 0 {
+        // TODO: Read the definition levels from the page and count the number of non-zero levels
+        // For now, assuming all values are present (no nulls)
+        page.num_values() as usize
+    } else {
+        0
+    };
+    match decoder.set_data(page.encoding(), bytes.clone(), num_levels, Some(page.num_values() as usize)) {
+        Ok(_) => (),
+        Err(e) => {
+            log::error!("Error setting data in decoder: {:?}", e);
+            return Err(e);
+        }
+    }
+    // Read the values into an OffsetBuffer
+    // let mut buffer = parquet::arrow::record_reader::buffer::OffsetBuffer::<i32>::default();
+    let mut buffer = crate::arrow::buffer::offset_buffer::OffsetBuffer::default();
+
+    println!("Page metadata: num_values={}, encoding={:?}", page.num_values(), page.encoding());
+    println!("Decoder metadata: num_levels={}, data_len={}", num_levels, bytes.len());
+    println!("Page buffer: {:?}", page.buffer());
+
+    let _num_values = match decoder.read(&mut buffer, page.num_values() as usize) {
+        Ok(num) => num,
+        Err(e) => {
+            log::error!("Error decoding byte array: {:?}", e);
+            log::debug!("Page metadata: num_values={}, encoding={:?}", page.num_values(), page.encoding());
+            log::debug!("Decoder metadata: num_levels={}, data_len={}", num_levels, bytes.len());
+            return Err(e);
+        }
+    };
+
+    // Convert the Vec<u8> to an Arrow Array
+    let array = buffer.into_array(None, DataType::Binary);
+    // let array = arrow::array::BinaryArray::from_vec(buffer);
+
+    // Create a SchemaDescriptor from the Parquet schema
+    let parquet_schema = parquet_metadata.file_metadata().schema_descr().clone();
+
+    // Create a RecordBatch from the array
+    // Create a RecordBatch from the array
+    let schema = parquet_to_arrow_schema(
+        &parquet_schema,
+        parquet_metadata.file_metadata().key_value_metadata(),
+    )
+        .unwrap();
+    let batch = arrow::record_batch::RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+
+    Ok(Some(batch))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use arrow_cast::pretty::print_batches;
+
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -243,6 +342,24 @@ mod tests {
         };
 
         let page = get_page_by_idx(file_to_read, random_indices[0].1, column_idx, random_indices[0].2).unwrap().unwrap();
+        let _buf = page.buffer(); // TODO: transform page buffer (data) to arrow/pyarrow object
         assert_eq!(page.page_type(), PageType::DATA_PAGE);
+    }
+
+
+    #[test]
+    fn test_read_page_into_batch(){
+        let testdata = arrow::util::test_util::parquet_test_data();
+        let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
+        let test_file = File::open(path).unwrap();
+
+        let row_group_idx = 0;
+        let column_idx = 0;
+        let page_idx = 0;
+
+        let batch = read_page_into_batch(test_file, row_group_idx, column_idx, page_idx)
+            .unwrap().unwrap();
+
+        print_batches(&[batch]).unwrap();
     }
 }

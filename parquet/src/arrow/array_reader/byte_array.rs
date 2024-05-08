@@ -192,7 +192,7 @@ impl<I: OffsetSizeTrait> ArrayReader for ByteArrayReader<I> {
 }
 
 /// A [`ColumnValueDecoder`] for variable length byte arrays
-struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
+pub struct ByteArrayColumnValueDecoder<I: OffsetSizeTrait> {
     dict: Option<OffsetBuffer<I>>,
     decoder: Option<ByteArrayDecoder>,
     validate_utf8: bool,
