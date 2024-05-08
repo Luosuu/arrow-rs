@@ -5,12 +5,14 @@ use rand::{Rng, thread_rng};
 use rand::seq::SliceRandom;
 
 use arrow_array::RecordBatch;
+use crate::data_type::Int32Type;
 use arrow_schema::DataType;
 
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
 use crate::arrow::parquet_to_arrow_schema;
+use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
 use crate::column::page::{Page, PageReader};
-use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
 use crate::compression::{Codec, create_codec};
 use crate::errors::Result;
 use crate::file::metadata::ColumnChunkMetaData;
@@ -20,6 +22,7 @@ use crate::file::reader::*;
 use crate::file::serialized_reader::decode_page;
 use crate::format::{PageHeader, PageLocation};
 use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
+use crate::util::test_common::page_util::InMemoryPageReader;
 
 pub fn get_file_page_locations(
     file: File
@@ -163,6 +166,7 @@ pub fn get_page_by_idx(
     page
 }
 
+/// a failed attempt to read page into batches through ByteArray decoder.
 /// maybe record_reader instead of low-level ByteArray decoder should be used here.
 pub fn read_page_into_batch(
     file: File,
@@ -238,7 +242,7 @@ pub fn read_page_into_batch(
     // let array = arrow::array::BinaryArray::from_vec(buffer);
 
     // Create a SchemaDescriptor from the Parquet schema
-    let parquet_schema = parquet_metadata.file_metadata().schema_descr().clone();
+    let parquet_schema = parquet_metadata.file_metadata().schema_descr();
 
     // Create a RecordBatch from the array
     // Create a RecordBatch from the array
@@ -252,6 +256,68 @@ pub fn read_page_into_batch(
     Ok(Some(batch))
 }
 
+/// an attempt to use record_read instead of ByteArray decoder to read records from pages
+pub fn read_record_from_page(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_idx: usize
+)-> Result<Option<RecordBatch>>{
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    // Get the column descriptor for the desired column
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    // Get the page for the desired column chunk and page index
+    let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)
+        .unwrap()
+        .unwrap();
+
+    // Create a RecordReader for the column
+    let mut record_reader : GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> = RecordReader::<Int32Type>::new(column_desc.clone());
+
+    // Create an InMemoryPageReader with the page data
+    println!("DEBUG INFO: page.buffer(): {:?}", page.buffer());
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+
+    // Set the page reader for the record reader
+    record_reader.set_page_reader(page_reader).unwrap();
+
+    // Read all the records from the page
+    let num_records_to_read = 100;
+    let num_read = record_reader.read_records(num_records_to_read).unwrap();
+
+    if num_read != num_records_to_read {
+        log::warn!(
+            "Expected to read {} records, but only read {}",
+            num_records_to_read,
+            num_read
+        );
+    }else { println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read); }
+
+    let record_data = record_reader.consume_record_data();
+
+    println!("DEBUG INFO: record_data: Vec<i32>: {:?}", record_data);
+    // Create an Arrow array from the values
+    let array = arrow::array::Int32Array::from(record_data);
+    // Create a SchemaDescriptor from the Parquet schema
+    let parquet_schema = parquet_metadata.file_metadata().schema_descr();
+
+    // Create a RecordBatch from the array
+    let schema = parquet_to_arrow_schema(
+        &parquet_schema,
+        parquet_metadata.file_metadata().key_value_metadata(),
+    ).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])
+        .unwrap();
+
+    Ok(Some(batch))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -259,7 +325,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch, read_record_from_page};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -350,14 +416,14 @@ mod tests {
     #[test]
     fn test_read_page_into_batch(){
         let testdata = arrow::util::test_util::parquet_test_data();
-        let path = format!("{testdata}/alltypes_tiny_pages_plain.parquet");
+        let path = format!("{testdata}/int32_with_null_pages.parquet");
         let test_file = File::open(path).unwrap();
 
         let row_group_idx = 0;
         let column_idx = 0;
-        let page_idx = 0;
+        let page_idx = 1;
 
-        let batch = read_page_into_batch(test_file, row_group_idx, column_idx, page_idx)
+        let batch = read_record_from_page(test_file, row_group_idx, column_idx, page_idx)
             .unwrap().unwrap();
 
         print_batches(&[batch]).unwrap();
