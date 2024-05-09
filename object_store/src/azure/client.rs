@@ -50,6 +50,10 @@ use url::Url;
 const VERSION_HEADER: &str = "x-ms-version-id";
 static MS_CACHE_CONTROL: HeaderName = HeaderName::from_static("x-ms-blob-cache-control");
 static MS_CONTENT_TYPE: HeaderName = HeaderName::from_static("x-ms-blob-content-type");
+static MS_CONTENT_DISPOSITION: HeaderName =
+    HeaderName::from_static("x-ms-blob-content-disposition");
+static MS_CONTENT_ENCODING: HeaderName = HeaderName::from_static("x-ms-blob-content-encoding");
+static MS_CONTENT_LANGUAGE: HeaderName = HeaderName::from_static("x-ms-blob-content-language");
 
 static TAGS_HEADER: HeaderName = HeaderName::from_static("x-ms-tags");
 
@@ -60,12 +64,6 @@ pub(crate) enum Error {
     #[snafu(display("Error performing get request {}: {}", path, source))]
     GetRequest {
         source: crate::client::retry::Error,
-        path: String,
-    },
-
-    #[snafu(display("Error getting get response body {}: {}", path, source))]
-    GetResponseBody {
-        source: reqwest::Error,
         path: String,
     },
 
@@ -89,11 +87,6 @@ pub(crate) enum Error {
 
     #[snafu(display("Got invalid list response: {}", source))]
     InvalidListResponse { source: quick_xml::de::DeError },
-
-    #[snafu(display("Error authorizing request: {}", source))]
-    Authorization {
-        source: crate::azure::credential::Error,
-    },
 
     #[snafu(display("Unable to extract metadata from headers: {}", source))]
     Metadata {
@@ -206,6 +199,11 @@ impl<'a> PutRequest<'a> {
         for (k, v) in &attributes {
             builder = match k {
                 Attribute::CacheControl => builder.header(&MS_CACHE_CONTROL, v.as_ref()),
+                Attribute::ContentDisposition => {
+                    builder.header(&MS_CONTENT_DISPOSITION, v.as_ref())
+                }
+                Attribute::ContentEncoding => builder.header(&MS_CONTENT_ENCODING, v.as_ref()),
+                Attribute::ContentLanguage => builder.header(&MS_CONTENT_LANGUAGE, v.as_ref()),
                 Attribute::ContentType => {
                     has_content_type = true;
                     builder.header(&MS_CONTENT_TYPE, v.as_ref())

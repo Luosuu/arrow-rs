@@ -409,14 +409,16 @@ impl MultipartStore for AmazonS3 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{client::get::GetClient, tests::*};
+    use crate::client::get::GetClient;
+    use crate::integration::*;
+    use crate::tests::*;
     use hyper::HeaderMap;
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
     #[tokio::test]
     async fn s3_test() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let config = AmazonS3Builder::from_env();
 
         let integration = config.build().unwrap();
@@ -437,10 +439,16 @@ mod tests {
 
         // Object tagging is not supported by S3 Express One Zone
         if config.session_provider.is_none() {
-            tagging(&integration, !config.disable_tagging, |p| {
-                let client = Arc::clone(&integration.client);
-                async move { client.get_object_tagging(&p).await }
-            })
+            tagging(
+                Arc::new(AmazonS3 {
+                    client: Arc::clone(&integration.client),
+                }),
+                !config.disable_tagging,
+                |p| {
+                    let client = Arc::clone(&integration.client);
+                    async move { client.get_object_tagging(&p).await }
+                },
+            )
             .await;
         }
 
@@ -469,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_test_get_nonexistent_location() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let integration = AmazonS3Builder::from_env().build().unwrap();
 
         let location = Path::from_iter([NON_EXISTENT_NAME]);
@@ -482,7 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_test_get_nonexistent_bucket() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let config = AmazonS3Builder::from_env().with_bucket_name(NON_EXISTENT_NAME);
         let integration = config.build().unwrap();
 
@@ -494,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_test_put_nonexistent_bucket() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let config = AmazonS3Builder::from_env().with_bucket_name(NON_EXISTENT_NAME);
         let integration = config.build().unwrap();
 
@@ -507,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_test_delete_nonexistent_location() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let integration = AmazonS3Builder::from_env().build().unwrap();
 
         let location = Path::from_iter([NON_EXISTENT_NAME]);
@@ -517,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn s3_test_delete_nonexistent_bucket() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let config = AmazonS3Builder::from_env().with_bucket_name(NON_EXISTENT_NAME);
         let integration = config.build().unwrap();
 
@@ -554,7 +562,7 @@ mod tests {
     }
 
     async fn s3_encryption(store: &AmazonS3) {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
 
         let data = PutPayload::from(vec![3u8; 1024]);
 

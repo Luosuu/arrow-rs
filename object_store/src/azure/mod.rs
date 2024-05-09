@@ -276,12 +276,13 @@ impl MultipartStore for MicrosoftAzure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integration::*;
     use crate::tests::*;
     use bytes::Bytes;
 
     #[tokio::test]
     async fn azure_blob_test() {
-        crate::test_util::maybe_skip_integration!();
+        maybe_skip_integration!();
         let integration = MicrosoftAzureBuilder::from_env().build().unwrap();
 
         put_get_delete_list(&integration).await;
@@ -296,10 +297,16 @@ mod tests {
         signing(&integration).await;
 
         let validate = !integration.client.config().disable_tagging;
-        tagging(&integration, validate, |p| {
-            let client = Arc::clone(&integration.client);
-            async move { client.get_blob_tagging(&p).await }
-        })
+        tagging(
+            Arc::new(MicrosoftAzure {
+                client: Arc::clone(&integration.client),
+            }),
+            validate,
+            |p| {
+                let client = Arc::clone(&integration.client);
+                async move { client.get_blob_tagging(&p).await }
+            },
+        )
         .await;
 
         // Azurite doesn't support attributes properly
