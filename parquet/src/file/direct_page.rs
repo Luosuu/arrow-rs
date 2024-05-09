@@ -4,8 +4,8 @@ use std::sync::Arc;
 use rand::{Rng, thread_rng};
 use rand::seq::SliceRandom;
 
-use arrow_array::RecordBatch;
-use crate::data_type::Int32Type;
+use arrow_array::{PrimitiveArray, RecordBatch};
+use crate::data_type::{Int32Type, Int64Type};
 use arrow_schema::DataType;
 
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
@@ -251,7 +251,7 @@ pub fn read_page_into_batch(
         parquet_metadata.file_metadata().key_value_metadata(),
     )
         .unwrap();
-    let batch = arrow::record_batch::RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)]).unwrap();
 
     Ok(Some(batch))
 }
@@ -262,7 +262,7 @@ pub fn read_record_from_page(
     row_group_idx: usize,
     column_idx: usize,
     page_idx: usize
-)-> Result<Option<RecordBatch>>{
+)-> Result<Option<PrimitiveArray<arrow_array::types::Int32Type>>>{
     let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
     let parquet_metadata = file_reader.metadata();
 
@@ -277,18 +277,19 @@ pub fn read_record_from_page(
         .unwrap()
         .unwrap();
 
+    // println!("DEBUG INFO: num  of values in the page: {:?}", page.num_values());
     // Create a RecordReader for the column
     let mut record_reader : GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> = RecordReader::<Int32Type>::new(column_desc.clone());
 
     // Create an InMemoryPageReader with the page data
-    println!("DEBUG INFO: page.buffer(): {:?}", page.buffer());
-    let page_reader = Box::new(InMemoryPageReader::new(vec![page]));
+    // println!("DEBUG INFO: page.buffer(): {:?}", page.buffer());
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
 
     // Set the page reader for the record reader
     record_reader.set_page_reader(page_reader).unwrap();
 
     // Read all the records from the page
-    let num_records_to_read = 100;
+    let num_records_to_read = usize::try_from(page.num_values()).unwrap();
     let num_read = record_reader.read_records(num_records_to_read).unwrap();
 
     if num_read != num_records_to_read {
@@ -297,25 +298,31 @@ pub fn read_record_from_page(
             num_records_to_read,
             num_read
         );
-    }else { println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read); }
+    }else {
+        // println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read);
+    }
 
     let record_data = record_reader.consume_record_data();
 
-    println!("DEBUG INFO: record_data: Vec<i32>: {:?}", record_data);
+    // println!("DEBUG INFO: record_data: Vec<i32>: {:?}", record_data); // Vec data here, next is to transform into Arrow object
     // Create an Arrow array from the values
-    let array = arrow::array::Int32Array::from(record_data);
+    let array = arrow_array::Int32Array::from(record_data);
+
+    // step to create RecordBatch
     // Create a SchemaDescriptor from the Parquet schema
-    let parquet_schema = parquet_metadata.file_metadata().schema_descr();
+    // let parquet_schema = parquet_metadata.file_metadata().schema_descr();
+    //
+    // // Create a RecordBatch from the array
+    // let schema = parquet_to_arrow_schema(
+    //     &parquet_schema,
+    //     parquet_metadata.file_metadata().key_value_metadata(),
+    // ).unwrap();
+    // let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])
+    //     .unwrap();
+    // However, the column number in original parquet schema does not match the data we read
+    // But Arrow array is enough.
 
-    // Create a RecordBatch from the array
-    let schema = parquet_to_arrow_schema(
-        &parquet_schema,
-        parquet_metadata.file_metadata().key_value_metadata(),
-    ).unwrap();
-    let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])
-        .unwrap();
-
-    Ok(Some(batch))
+    Ok(Some(array))
 }
 
 #[cfg(test)]
@@ -416,16 +423,16 @@ mod tests {
     #[test]
     fn test_read_page_into_batch(){
         let testdata = arrow::util::test_util::parquet_test_data();
-        let path = format!("{testdata}/int32_with_null_pages.parquet");
+        // let path = format!("{testdata}/int32_with_null_pages.parquet");
+        let path = format!("{testdata}/data-pq-00000-int32.parquet");
         let test_file = File::open(path).unwrap();
 
         let row_group_idx = 0;
         let column_idx = 0;
         let page_idx = 1;
 
-        let batch = read_record_from_page(test_file, row_group_idx, column_idx, page_idx)
+        let array = read_record_from_page(test_file, row_group_idx, column_idx, page_idx)
             .unwrap().unwrap();
 
-        print_batches(&[batch]).unwrap();
     }
 }
