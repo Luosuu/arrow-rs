@@ -19,25 +19,38 @@ use arrow::util::pretty::print_batches;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::errors::Result;
 use std::fs::File;
+use parquet::arrow::ProjectionMask;
 
 fn main() -> Result<()> {
     // Create parquet file that will be read.
     let testdata = arrow::util::test_util::parquet_test_data();
-    let path = format!("{testdata}/alltypes_plain.parquet");
+    // let path = format!("{testdata}/alltypes_plain.parquet");
+    let path = format!("{testdata}/data-pq-00000-int32.snappy.parquet");
     let file = File::open(path).unwrap();
 
     // Create a sync parquet reader with batch_size.
     // batch_size is the number of rows to read up to buffer once from pages, defaults to 1024
-    let parquet_reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .with_batch_size(8192)
-        .build()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), [0, 2]);
+    // let parquet_reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+    //     .with_batch_size(8192)
+    //     .with_projection(0)
+    //     .build()?;
+    let parquet_reader = builder
+        .with_projection(mask)
+        .with_batch_size(1024)
+        .build()
+        .unwrap();
 
     let mut batches = Vec::new();
 
+    use std::time::Instant;
+    let now = Instant::now();
     for batch in parquet_reader {
         batches.push(batch?);
     }
-
-    print_batches(&batches).unwrap();
+    let elapsed = now.elapsed();
+    println!("Elapsed: {:.2?}", elapsed);
+    // print_batches(&batches).unwrap();
     Ok(())
 }

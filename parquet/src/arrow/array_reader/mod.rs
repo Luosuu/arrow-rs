@@ -31,7 +31,7 @@ use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 mod builder;
-mod byte_array;
+pub mod byte_array;
 mod byte_array_dictionary;
 mod byte_view_array;
 mod cached_array_reader;
@@ -47,7 +47,7 @@ mod row_number;
 mod struct_array;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 // Note that this crate is public under the `experimental` feature flag.
 use crate::file::metadata::RowGroupMetaData;

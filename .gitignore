@@ -20,6 +20,9 @@ justfile
 __azurite*
 __blobstorage__
 
+# large test data
+data-pq-*
+
 # .bak files
 *.bak
 *.bak2

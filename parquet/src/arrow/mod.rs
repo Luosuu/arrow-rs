@@ -179,10 +179,13 @@
 //! assert_eq!(50, record_batch.num_rows());
 //! ```
 
-experimental!(mod array_reader);
+// experimental!(mod array_reader);
+
+// pub mod array_reader;
+
 pub mod arrow_reader;
 pub mod arrow_writer;
-mod buffer;
+pub(crate) mod buffer;
 mod decoder;
 
 #[cfg(feature = "async")]
@@ -193,7 +196,8 @@ pub mod async_writer;
 pub mod push_decoder;
 
 mod in_memory_row_group;
-mod record_reader;
+pub mod record_reader;
+pub(crate) mod array_reader;
 
 experimental!(mod schema);
 
