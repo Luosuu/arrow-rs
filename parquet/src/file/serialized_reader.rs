@@ -520,6 +520,20 @@ pub struct SerializedPageReader<R: ChunkReader> {
     state: SerializedPageReaderState,
 }
 
+trait GetPageReaderProperties {
+    fn get_physical_type(&self) -> Type;
+    fn get_decompressor(&self) -> &Option<Box<dyn Codec>>;
+}
+
+impl<R: ChunkReader> GetPageReaderProperties for SerializedPageReader<R> {
+    fn get_physical_type(&self) -> Type {
+        self.physical_type
+    }
+    fn get_decompressor(&self) -> &Option<Box<dyn Codec>> {
+        &self.decompressor
+    }
+}
+
 impl<R: ChunkReader> SerializedPageReader<R> {
     /// Creates a new serialized page reader from a chunk reader and metadata
     pub fn new(

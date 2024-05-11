@@ -33,7 +33,7 @@ use crate::data_type::DataType;
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
-pub(crate) mod buffer;
+pub mod buffer;
 mod definition_levels;
 
 /// A `RecordReader` is a stateful column reader that delimits semantic records.

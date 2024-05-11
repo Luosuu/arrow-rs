@@ -30,7 +30,7 @@ use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 mod builder;
-mod byte_array;
+pub mod byte_array;
 mod byte_array_dictionary;
 mod empty_array;
 mod fixed_len_byte_array;
@@ -42,7 +42,7 @@ mod primitive_array;
 mod struct_array;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 pub use builder::build_array_reader;
 pub use byte_array::make_byte_array_reader;

@@ -77,7 +77,7 @@ edition = "2021"
 rust-version = "1.62"
 
 [workspace.dependencies]
-arrow = { version = "51.0.0", path = "./arrow", default-features = false }
+arrow = { version = "51.0.0", path = "./arrow", default-features = true }
 arrow-arith = { version = "51.0.0", path = "./arrow-arith" }
 arrow-array = { version = "51.0.0", path = "./arrow-array" }
 arrow-buffer = { version = "51.0.0", path = "./arrow-buffer" }
@@ -91,6 +91,6 @@ arrow-row = { version = "51.0.0", path = "./arrow-row" }
 arrow-schema = { version = "51.0.0", path = "./arrow-schema" }
 arrow-select = { version = "51.0.0", path = "./arrow-select" }
 arrow-string = { version = "51.0.0", path = "./arrow-string" }
-parquet = { version = "51.0.0", path = "./parquet", default-features = false }
+parquet = { version = "51.0.0", path = "./parquet", default-features = true }
 
 chrono = { version = "0.4.34", default-features = false, features = ["clock"] }
