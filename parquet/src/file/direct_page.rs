@@ -4,10 +4,11 @@ use std::{fs::File, io::Read};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
-use crate::data_type::{Int32Type, Int64Type};
+
 use arrow_array::{PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 
+use crate::data_type::{Int32Type, Int64Type};
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
 use crate::arrow::parquet_to_arrow_schema;
 use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
