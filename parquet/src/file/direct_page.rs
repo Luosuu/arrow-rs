@@ -1,21 +1,20 @@
+use arrow_array::types::Utf8Type;
+use arrow_array::{Array, GenericByteArray, PrimitiveArray, RecordBatch};
+use arrow_schema::DataType;
+use rand::seq::SliceRandom;
+use rand::{thread_rng, Rng};
 use std::sync::Arc;
 use std::{fs::File, io::Read};
 
-use rand::seq::SliceRandom;
-use rand::{thread_rng, Rng};
-
-
-use arrow_array::{PrimitiveArray, RecordBatch};
-use arrow_schema::DataType;
-
-use crate::data_type::{Int32Type, Int64Type};
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
 use crate::arrow::parquet_to_arrow_schema;
 use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
 use crate::column::page::{Page, PageReader};
+use crate::column::reader::{ColumnReader, get_column_reader, get_typed_column_reader};
 use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
 use crate::compression::{create_codec, Codec};
-use crate::errors::Result;
+use crate::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
+use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
 use crate::file::page_index::index_reader::read_pages_locations;
 use crate::file::properties::ReaderProperties;
@@ -330,15 +329,15 @@ pub fn read_record_from_page(
     let num_records_to_read = usize::try_from(page.num_values()).unwrap();
     let num_read = record_reader.read_records(num_records_to_read).unwrap();
 
-    if num_read != num_records_to_read {
-        log::warn!(
-            "Expected to read {} records, but only read {}",
-            num_records_to_read,
-            num_read
-        );
-    } else {
-        // println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read);
-    }
+    // if num_read != num_records_to_read {
+    //     log::warn!(
+    //         "Expected to read {} records, but only read {}",
+    //         num_records_to_read,
+    //         num_read
+    //     );
+    // } else {
+    //     // println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read);
+    // }
 
     let record_data = record_reader.consume_record_data();
 
@@ -363,6 +362,60 @@ pub fn read_record_from_page(
     Ok(Some(array))
 }
 
+pub fn read_record_from_page_string(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_idx: usize,
+) -> Result<Option<GenericByteArray<Utf8Type>>> {
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    // Get the column descriptor for the desired column
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    /// potentially we can infer the data type (INT32/BYTE_ARRAY) from column_desc
+    /// let col_physical_type = column_desc.physical_type();
+    // Get the page for the desired column chunk and page index
+    let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)
+        .unwrap()
+        .unwrap();
+
+    // let mut record_reader = RecordReader::<ByteArrayType>::new(column_desc.clone());
+    
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+    
+    // record_reader.set_page_reader(page_reader).expect("TODO: panic message");
+    
+    let column_reader: ColumnReader = get_column_reader(column_desc, page_reader);
+    let mut typed_column_reader = get_typed_column_reader::<ByteArrayType>(column_reader);
+
+    let num_records_to_read = usize::try_from(page.num_values()).unwrap();
+
+    let mut values = Vec::new();
+    let mut def_levels = Vec::new();
+    let mut rep_levels = Vec::new();
+
+    let (_, values_read, levels_read) = typed_column_reader
+        .read_records(
+            num_records_to_read,
+            Some(&mut def_levels),
+            Some(&mut rep_levels),
+            &mut values,
+        )
+        .expect("read_batch() should be OK");
+
+
+    let str_values: Vec<Option<&str>> = values.iter().map(|ba| Some(ba.as_utf8().unwrap())).collect();
+
+    let array = GenericByteArray::<Utf8Type>::from(str_values);
+
+    Ok(Some(array))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -370,10 +423,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{
-        generate_random_page_indices_dataset_level, generate_random_page_indices_file_level,
-        get_file_page_locations, get_page_by_idx, read_page_into_batch, read_record_from_page,
-    };
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch, read_record_from_page, read_record_from_page_string};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -401,7 +451,12 @@ mod tests {
 
     #[test]
     fn test_file_page_num() {
-        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        // let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let testdata = arrow::util::test_util::parquet_test_data();
+        // let path = format!("{testdata}/int32_with_null_pages.parquet");
+        let path = format!("{testdata}/data-pq-string-test.parquet");
+        let test_file = File::open(path).unwrap();
+
         let page_locations = get_file_page_locations(test_file.try_clone().unwrap())
             .unwrap()
             .unwrap();
@@ -489,6 +544,21 @@ mod tests {
         let page_idx = 1;
 
         let array = read_record_from_page(test_file, row_group_idx, column_idx, page_idx)
+            .unwrap()
+            .unwrap();
+    }
+    #[test]
+    fn test_read_string_page_into_batch() {
+        let testdata = arrow::util::test_util::parquet_test_data();
+        // let path = format!("{testdata}/int32_with_null_pages.parquet");
+        let path = format!("{testdata}/data-pq-string-test.parquet");
+        let test_file = File::open(path).unwrap();
+
+        let row_group_idx = 0;
+        let column_idx = 0;
+        let page_idx = 0;
+
+        let array = read_record_from_page_string(test_file, row_group_idx, column_idx, page_idx)
             .unwrap()
             .unwrap();
     }
