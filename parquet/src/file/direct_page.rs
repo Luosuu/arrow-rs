@@ -173,6 +173,44 @@ pub fn get_page_by_idx(
     page
 }
 
+pub fn get_page_by_idx_pm(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_location_offset: i64,
+    compressed_page_size: i32
+) -> Result<Option<Page>> {
+
+    // buffer
+    let buffer = file
+        .get_bytes(
+            page_location_offset as u64,
+            compressed_page_size as usize,
+        )
+        .unwrap();
+    let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
+    let page_header = PageHeader::read_from_in_protocol(&mut prot).unwrap();
+    let offset = buffer.len() - prot.as_slice().len();
+
+    let bytes = buffer.slice(offset..);
+
+    let file_clone = file.try_clone().unwrap();
+    let file_reader = SerializedFileReader::new(file_clone).unwrap();
+    let row_group_reader = file_reader.get_row_group(row_group_idx)?;
+
+    let column_meta = row_group_reader.metadata().column(column_idx);
+    // let page = get_page_by_location(file, page_location.clone(), column_meta);
+
+    // let column_meta = row_group_reader.metadata().column(column_idx);
+    let physical_type = column_meta.column_type();
+    let props = Arc::new(ReaderProperties::builder().build());
+    let decompressor = &mut create_codec(column_meta.compression(), props.codec_options())?;
+
+    let page = decode_page(page_header, bytes, physical_type, decompressor.as_mut())?;
+
+    Ok(Some(page))
+}
+
 /// a failed attempt to read page into batches through ByteArray decoder.
 /// maybe record_reader instead of low-level ByteArray decoder should be used here.
 pub fn read_page_into_batch(
@@ -292,7 +330,7 @@ pub fn read_page_into_batch(
     Ok(Some(batch))
 }
 
-/// an attempt to use record_read instead of ByteArray decoder to read records from pages
+/// a successful attempt to use record_read instead of ByteArray decoder to read records from pages
 pub fn read_record_from_page(
     file: File,
     row_group_idx: usize,
@@ -310,6 +348,77 @@ pub fn read_record_from_page(
 
     // Get the page for the desired column chunk and page index
     let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)
+        .unwrap()
+        .unwrap();
+
+    // println!("DEBUG INFO: num  of values in the page: {:?}", page.num_values());
+    // Create a RecordReader for the column
+    let mut record_reader: GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> =
+        RecordReader::<Int32Type>::new(column_desc.clone());
+
+    // Create an InMemoryPageReader with the page data
+    // println!("DEBUG INFO: page.buffer(): {:?}", page.buffer());
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+
+    // Set the page reader for the record reader
+    record_reader.set_page_reader(page_reader).unwrap();
+
+    // Read all the records from the page
+    let num_records_to_read = usize::try_from(page.num_values()).unwrap();
+    let num_read = record_reader.read_records(num_records_to_read).unwrap();
+
+    // if num_read != num_records_to_read {
+    //     log::warn!(
+    //         "Expected to read {} records, but only read {}",
+    //         num_records_to_read,
+    //         num_read
+    //     );
+    // } else {
+    //     // println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read);
+    // }
+
+    let record_data = record_reader.consume_record_data();
+
+    // println!("DEBUG INFO: record_data: Vec<i32>: {:?}", record_data); // Vec data here, next is to transform into Arrow object
+    // Create an Arrow array from the values
+    let array = arrow_array::Int32Array::from(record_data);
+
+    // step to create RecordBatch
+    // Create a SchemaDescriptor from the Parquet schema
+    // let parquet_schema = parquet_metadata.file_metadata().schema_descr();
+    //
+    // // Create a RecordBatch from the array
+    // let schema = parquet_to_arrow_schema(
+    //     &parquet_schema,
+    //     parquet_metadata.file_metadata().key_value_metadata(),
+    // ).unwrap();
+    // let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])
+    //     .unwrap();
+    // However, the column number in original parquet schema does not match the data we read
+    // But Arrow array is enough.
+
+    Ok(Some(array))
+}
+
+/// the version to read page data without retriving metadata for page locations
+pub fn read_record_from_page_pm(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_location_offset: i64,
+    compressed_page_size: i32
+) -> Result<Option<PrimitiveArray<arrow_array::types::Int32Type>>> {
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    // Get the column descriptor for the desired column
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    // Get the page for the desired column chunk and page index
+    let page: Page = get_page_by_idx_pm(file, row_group_idx, column_idx, page_location_offset, compressed_page_size)
         .unwrap()
         .unwrap();
 
