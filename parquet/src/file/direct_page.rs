@@ -13,6 +13,7 @@ use crate::column::page::{Page, PageReader};
 use crate::column::reader::{ColumnReader, get_column_reader, get_typed_column_reader};
 use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
 use crate::compression::{create_codec, Codec};
+use crate::basic::Type as PhysicalType;
 use crate::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
@@ -429,6 +430,106 @@ pub fn read_record_from_page_string(
     Ok(Some(array))
 }
 
+/// Reads a single page from a Parquet file and returns the data as an Arrow array
+/// along with the number of rows in that page.
+///
+/// This function auto-detects the physical type of the column (INT32, INT64, or
+/// BYTE_ARRAY/String) and uses the appropriate decoder to produce an Arrow array.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - The zero-based index of the row group to read from.
+/// * `column_idx` - The zero-based index of the column to read.
+/// * `page_idx` - The zero-based index of the page within the column chunk.
+///
+/// # Returns
+/// A tuple of `(Arc<dyn Array>, usize)` where the array contains the decoded row-level
+/// data and the `usize` is the number of rows in the page.
+///
+/// # Supported physical types
+/// - `INT32` — returns an `Int32Array`
+/// - `INT64` — returns an `Int64Array`
+/// - `BYTE_ARRAY` — returns a `StringArray` (UTF-8)
+///
+/// # Errors
+/// Returns `ParquetError` if the page cannot be read, the physical type is unsupported,
+/// or decoding fails.
+pub fn read_page_with_row_count(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_idx: usize,
+) -> Result<(Arc<dyn Array>, usize)> {
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    let physical_type = column_desc.physical_type();
+
+    let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)?
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "No page found for row_group={}, column={}, page={}",
+                row_group_idx, column_idx, page_idx
+            ))
+        })?;
+
+    match physical_type {
+        PhysicalType::INT32 => {
+            let mut record_reader: GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> =
+                RecordReader::<Int32Type>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Int32Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
+        PhysicalType::INT64 => {
+            let mut record_reader: GenericRecordReader<Vec<i64>, ColumnValueDecoderImpl<Int64Type>> =
+                RecordReader::<Int64Type>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Int64Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
+        PhysicalType::BYTE_ARRAY => {
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            let column_reader: ColumnReader = get_column_reader(column_desc, page_reader);
+            let mut typed_reader = get_typed_column_reader::<ByteArrayType>(column_reader);
+            let num_to_read = page.num_values() as usize;
+            let mut values = Vec::new();
+            let mut def_levels = Vec::new();
+            let mut rep_levels = Vec::new();
+            let (_, values_read, _) = typed_reader
+                .read_records(
+                    num_to_read,
+                    Some(&mut def_levels),
+                    Some(&mut rep_levels),
+                    &mut values,
+                )?;
+            let str_values: Vec<Option<&str>> = values
+                .iter()
+                .map(|ba| Some(ba.as_utf8().unwrap()))
+                .collect();
+            let array = GenericByteArray::<Utf8Type>::from(str_values);
+            Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+        }
+        _ => Err(ParquetError::General(format!(
+            "Unsupported physical type {:?} for read_page_with_row_count",
+            physical_type
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -436,9 +537,24 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch, read_record_from_page, read_record_from_page_string};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
+
+    /// Helper to open a custom test fixture from test/fixtures/ directory.
+    fn get_fixture_file(name: &str) -> File {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../test/fixtures");
+        path.push(name);
+        File::open(&path).unwrap_or_else(|e| {
+            panic!(
+                "Fixture file {} not found at {}: {}. Run: uv run python test/fixtures/generate_test_parquet.py",
+                name,
+                path.display(),
+                e
+            )
+        })
+    }
 
     #[test]
     fn test_direct_access_page_by_idx() {
@@ -567,5 +683,119 @@ mod tests {
         let array = read_record_from_page_string(test_file, row_group_idx, column_idx, page_idx)
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_int32() {
+        // Use upstream test file: column 0 is INT32 (id)
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let (array, row_count) = read_page_with_row_count(test_file, 0, 0, 0).unwrap();
+        assert!(row_count > 0, "row_count should be positive");
+        assert_eq!(array.len(), row_count, "array length should match row_count");
+        assert_eq!(
+            array.data_type(),
+            &arrow_schema::DataType::Int32,
+            "should produce Int32Array"
+        );
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_string() {
+        // Use upstream test file: column 9 is BYTE_ARRAY (string_col)
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let (array, row_count) = read_page_with_row_count(test_file, 0, 9, 0).unwrap();
+        assert!(row_count > 0, "row_count should be positive");
+        assert_eq!(array.len(), row_count, "array length should match row_count");
+        assert_eq!(
+            array.data_type(),
+            &arrow_schema::DataType::Utf8,
+            "should produce StringArray"
+        );
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_fixture_int32() {
+        // Custom fixture: single_int32.parquet — 1 INT32 column, 2 row groups x 500 rows
+        let file = get_fixture_file("single_int32.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        // Sum row counts across all pages in row group 0 to verify they total 2000
+        let num_pages_rg0 = page_locations[0][0].len();
+        assert!(num_pages_rg0 > 1, "fixture should have multiple pages per column, got {}", num_pages_rg0);
+
+        let mut total_rows_rg0 = 0;
+        for page_idx in 0..num_pages_rg0 {
+            let f = get_fixture_file("single_int32.parquet");
+            let (array, row_count) = read_page_with_row_count(f, 0, 0, page_idx).unwrap();
+            assert_eq!(array.len(), row_count);
+            total_rows_rg0 += row_count;
+        }
+        assert_eq!(total_rows_rg0, 2000, "row group 0 should have exactly 2000 rows");
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_fixture_string() {
+        // Custom fixture: single_string.parquet — 1 String column, 2 row groups x 500 rows
+        let file = get_fixture_file("single_string.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let num_pages_rg0 = page_locations[0][0].len();
+        assert!(num_pages_rg0 > 1, "fixture should have multiple pages per column");
+
+        let mut total_rows_rg0 = 0;
+        for page_idx in 0..num_pages_rg0 {
+            let f = get_fixture_file("single_string.parquet");
+            let (array, row_count) = read_page_with_row_count(f, 0, 0, page_idx).unwrap();
+            assert_eq!(array.len(), row_count);
+            total_rows_rg0 += row_count;
+        }
+        assert_eq!(total_rows_rg0, 2000, "row group 0 should have exactly 2000 rows");
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_fixture_multi_column() {
+        // Custom fixture: multi_column.parquet — col 0: INT32, col 1: String, col 2: INT64
+        // 2 row groups x 500 rows each
+        let file = get_fixture_file("multi_column.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        // Verify all 3 column types across both row groups
+        for rg_idx in 0..2 {
+            for (col_idx, expected_type) in [
+                (0, arrow_schema::DataType::Int32),
+                (1, arrow_schema::DataType::Utf8),
+                (2, arrow_schema::DataType::Int64),
+            ] {
+                let num_pages = page_locations[rg_idx][col_idx].len();
+                assert!(num_pages > 0, "should have at least one page");
+
+                let mut total_rows = 0;
+                for page_idx in 0..num_pages {
+                    let f = get_fixture_file("multi_column.parquet");
+                    let (array, row_count) =
+                        read_page_with_row_count(f, rg_idx, col_idx, page_idx).unwrap();
+                    assert_eq!(array.len(), row_count);
+                    assert_eq!(
+                        array.data_type(),
+                        &expected_type,
+                        "column {} should be {:?}",
+                        col_idx,
+                        expected_type
+                    );
+                    total_rows += row_count;
+                }
+                assert_eq!(
+                    total_rows, 2000,
+                    "row group {} column {} should have 2000 rows total",
+                    rg_idx, col_idx
+                );
+            }
+        }
     }
 }
