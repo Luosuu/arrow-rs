@@ -814,10 +814,11 @@ fn read_rows_from_column(
 mod tests {
     use std::fs::File;
 
+    use arrow_array::Array as _;
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -1320,5 +1321,438 @@ mod tests {
         }
         // 2 files x 2 row groups x 2000 rows = 8000 total rows
         assert_eq!(total_rows, 8000, "dataset-level shuffled reads should cover all rows");
+    }
+
+    // ==================== Comprehensive tests for US-010 ====================
+
+    // --- get_file_page_locations tests ---
+
+    #[test]
+    fn test_get_file_page_locations_fixture_structure() {
+        // Verify the page locations structure: 2 row groups, 3 columns, multiple pages each
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        assert_eq!(locs.len(), 2, "should have 2 row groups");
+        for rg_idx in 0..2 {
+            assert_eq!(locs[rg_idx].len(), 3, "each row group should have 3 columns");
+            for col_idx in 0..3 {
+                assert!(
+                    locs[rg_idx][col_idx].len() > 1,
+                    "rg {} col {} should have multiple pages, got {}",
+                    rg_idx, col_idx, locs[rg_idx][col_idx].len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_file_page_locations_single_column_file() {
+        let file = get_fixture_file("single_int32.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        assert_eq!(locs.len(), 2, "should have 2 row groups");
+        for rg_idx in 0..2 {
+            assert_eq!(locs[rg_idx].len(), 1, "single-column file should have 1 column");
+            assert!(locs[rg_idx][0].len() > 1, "should have multiple pages");
+        }
+    }
+
+    #[test]
+    fn test_get_file_page_locations_page_locations_monotonic() {
+        // first_row_index should be strictly monotonically increasing within each column
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for rg_idx in 0..locs.len() {
+            for col_idx in 0..locs[rg_idx].len() {
+                let pages = &locs[rg_idx][col_idx];
+                assert_eq!(pages[0].first_row_index, 0, "first page should start at row 0");
+                for i in 1..pages.len() {
+                    assert!(
+                        pages[i].first_row_index > pages[i - 1].first_row_index,
+                        "first_row_index should be strictly increasing: rg={} col={} page={} ({} <= {})",
+                        rg_idx, col_idx, i, pages[i].first_row_index, pages[i - 1].first_row_index
+                    );
+                }
+            }
+        }
+    }
+
+    // --- get_page_by_idx tests ---
+
+    #[test]
+    fn test_get_page_by_idx_fixture_both_row_groups() {
+        // Test page access from both row groups in fixture files
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for rg_idx in 0..2 {
+            let num_pages = locs[rg_idx][0].len();
+            for page_idx in 0..num_pages {
+                let f = get_fixture_file("multi_column.parquet");
+                let page = get_page_by_idx(f, rg_idx, 0, page_idx).unwrap().unwrap();
+                assert_eq!(page.page_type(), PageType::DATA_PAGE);
+                assert!(page.num_values() > 0, "page should have values");
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_page_by_idx_all_column_types() {
+        // Access first page of each column type in multi_column.parquet
+        for col_idx in 0..3 {
+            let f = get_fixture_file("multi_column.parquet");
+            let page = get_page_by_idx(f, 0, col_idx, 0).unwrap().unwrap();
+            assert_eq!(page.page_type(), PageType::DATA_PAGE);
+            assert!(page.num_values() > 0);
+        }
+    }
+
+    // --- generate_random_page_indices_file_level tests ---
+
+    #[test]
+    fn test_random_indices_file_level_coverage() {
+        // All page indices should be covered exactly once
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let column_idx = 0;
+        let total_pages: usize = locs.iter().map(|rg| rg[column_idx].len()).sum();
+
+        let indices = generate_random_page_indices_file_level(locs.clone(), column_idx).unwrap();
+        assert_eq!(indices.len(), total_pages, "should cover all pages");
+
+        // Every (rg, page) pair should appear exactly once
+        let mut seen = std::collections::HashSet::new();
+        for &(rg_idx, page_idx) in &indices {
+            assert!(rg_idx < locs.len(), "rg_idx out of range");
+            assert!(page_idx < locs[rg_idx][column_idx].len(), "page_idx out of range");
+            assert!(seen.insert((rg_idx, page_idx)), "duplicate ({}, {})", rg_idx, page_idx);
+        }
+    }
+
+    #[test]
+    fn test_random_indices_file_level_different_columns() {
+        // Test index generation for each column — different columns may have different page counts
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for col_idx in 0..3 {
+            let total_pages: usize = locs.iter().map(|rg| rg[col_idx].len()).sum();
+            let indices = generate_random_page_indices_file_level(locs.clone(), col_idx).unwrap();
+            assert_eq!(indices.len(), total_pages, "column {} page count mismatch", col_idx);
+        }
+    }
+
+    // --- generate_random_page_indices_dataset_level tests ---
+
+    #[test]
+    fn test_random_indices_dataset_level_coverage() {
+        // All pages across all files should be covered exactly once
+        let file0 = get_fixture_file("multi_column.parquet");
+        let file1 = get_fixture_file("single_int32.parquet");
+
+        let locs0 = get_file_page_locations(file0).unwrap().unwrap();
+        let locs1 = get_file_page_locations(file1).unwrap().unwrap();
+
+        let column_idx = 0;
+        let dataset = vec![locs0.clone(), locs1.clone()];
+        let total_pages: usize = dataset.iter()
+            .flat_map(|f| f.iter())
+            .map(|rg| rg[column_idx].len())
+            .sum();
+
+        let indices = generate_random_page_indices_dataset_level(dataset.clone(), column_idx).unwrap();
+        assert_eq!(indices.len(), total_pages);
+
+        let mut seen = std::collections::HashSet::new();
+        for &(file_idx, rg_idx, page_idx) in &indices {
+            assert!(file_idx < dataset.len());
+            assert!(rg_idx < dataset[file_idx].len());
+            assert!(page_idx < dataset[file_idx][rg_idx][column_idx].len());
+            assert!(seen.insert((file_idx, rg_idx, page_idx)));
+        }
+    }
+
+    // --- read_page_with_row_count additional tests ---
+
+    #[test]
+    fn test_read_page_with_row_count_fixture_int64() {
+        // Custom fixture: multi_column.parquet, column 2 is INT64 (score)
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let col_idx = 2; // INT64 column
+        let num_pages = locs[0][col_idx].len();
+        let mut total_rows = 0;
+
+        for page_idx in 0..num_pages {
+            let f = get_fixture_file("multi_column.parquet");
+            let (array, row_count) = read_page_with_row_count(f, 0, col_idx, page_idx).unwrap();
+            assert_eq!(array.len(), row_count);
+            assert_eq!(array.data_type(), &arrow_schema::DataType::Int64);
+            total_rows += row_count;
+        }
+        assert_eq!(total_rows, 2000, "INT64 column should have 2000 rows in row group 0");
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_data_values_int32() {
+        // Verify actual INT32 values are correct (fixture generates col0 = row_idx)
+        let f = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_page_with_row_count(f, 0, 0, 0).unwrap();
+
+        let int32_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        // First page of row group 0 starts at row 0
+        for i in 0..row_count {
+            assert_eq!(int32_array.value(i), i as i32, "row {} should equal its index", i);
+        }
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_data_values_int64() {
+        // Verify actual INT64 values: col2 = row_idx * 100
+        let f = get_fixture_file("multi_column.parquet");
+        let (array, _) = read_page_with_row_count(f, 0, 2, 0).unwrap();
+
+        let int64_array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        // The first page of INT64 column might not start at row 0 of the reference column,
+        // but its own values should follow the pattern val = some_offset * 100
+        // Since page 0 of each column starts at row 0 for the same row group:
+        for i in 0..int64_array.len() {
+            assert_eq!(int64_array.value(i), i as i64 * 100, "INT64 row {} should be {} * 100", i, i);
+        }
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_data_values_string() {
+        // Verify actual string values: col1 = "item_{row_idx:06d}"
+        let f = get_fixture_file("multi_column.parquet");
+        let (array, _) = read_page_with_row_count(f, 0, 1, 0).unwrap();
+
+        let str_array = array.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        for i in 0..str_array.len() {
+            let expected = format!("item_{:06}", i);
+            assert_eq!(str_array.value(i), expected, "row {} string mismatch", i);
+        }
+    }
+
+    #[test]
+    fn test_read_page_with_row_count_row_group_1_offset() {
+        // Row group 1 starts at row 2000. Verify col0 values start from 2000.
+        let f = get_fixture_file("multi_column.parquet");
+        let (array, _) = read_page_with_row_count(f, 1, 0, 0).unwrap();
+
+        let int32_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        // Row group 1 values should start at 2000 (the offset)
+        assert_eq!(int32_array.value(0), 2000, "first value in row group 1 should be 2000");
+    }
+
+    // --- read_multi_column_aligned additional tests ---
+
+    #[test]
+    fn test_read_multi_column_aligned_empty_column_indices() {
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[], 0).unwrap();
+        assert!(results.is_empty(), "empty column_indices should return empty results");
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_single_column() {
+        // Using multi-column aligned with a single column should still work
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[1], 0).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1 > 0);
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Utf8);
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_string_data_correctness() {
+        // Verify string column data is correctly aligned with INT32 column
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[0, 1], 0).unwrap();
+
+        let int32_array = results[0].0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let str_array = results[1].0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+
+        for i in 0..int32_array.len() {
+            let expected_name = format!("item_{:06}", int32_array.value(i));
+            assert_eq!(
+                str_array.value(i), expected_name,
+                "row {}: string '{}' doesn't match INT32 value {}",
+                i, str_array.value(i), int32_array.value(i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_all_pages_row_group_1() {
+        // Cover all pages in row group 1 and verify total rows
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let num_pages = locs[1][0].len();
+        let mut total_rows = 0;
+
+        for page_idx in 0..num_pages {
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, 1, &[0, 1, 2], page_idx).unwrap();
+            total_rows += results[0].1;
+        }
+        assert_eq!(total_rows, 2000, "row group 1 should have 2000 rows total");
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_page_idx_out_of_range() {
+        // Accessing a page index beyond the reference column's page count should error
+        let file = get_fixture_file("multi_column.parquet");
+        let result = read_multi_column_aligned(file, 0, &[0, 1, 2], 9999);
+        assert!(result.is_err(), "out-of-range page_idx should return error");
+    }
+
+    // --- Shuffled multi-column index generation additional tests ---
+
+    #[test]
+    fn test_shuffled_multi_column_file_level_with_different_ref_columns() {
+        // Test that shuffling works with different reference columns
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for ref_col in 0..3 {
+            let total_pages: usize = locs.iter().map(|rg| rg[ref_col].len()).sum();
+            let shuffled = generate_shuffled_multi_column_indices_file_level(&locs, ref_col).unwrap();
+            assert_eq!(shuffled.len(), total_pages, "ref_col {} page count mismatch", ref_col);
+
+            let mut seen = std::collections::HashSet::new();
+            for &(rg, page) in &shuffled {
+                assert!(seen.insert((rg, page)));
+            }
+            assert_eq!(seen.len(), total_pages);
+        }
+    }
+
+    #[test]
+    fn test_shuffled_multi_column_dataset_level_data_correctness() {
+        // Verify that shuffled dataset-level indices produce correct data when read
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let dataset = vec![locs];
+        let ref_col = 0;
+        let shuffled = generate_shuffled_multi_column_indices_dataset_level(&dataset, ref_col).unwrap();
+
+        // Collect all INT32 values across all shuffled pages
+        let mut all_values = std::collections::HashSet::new();
+        for &(_, rg_idx, page_idx) in &shuffled {
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, rg_idx, &[0], page_idx).unwrap();
+            let int32_array = results[0].0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            for i in 0..int32_array.len() {
+                all_values.insert(int32_array.value(i));
+            }
+        }
+        // With 1 file x 2 row groups x 2000 rows, we expect values 0..4000
+        assert_eq!(all_values.len(), 4000, "should see all 4000 unique values");
+    }
+
+    // --- read_record_from_page additional tests ---
+
+    #[test]
+    fn test_read_record_from_page_fixture_int32() {
+        // Test with fixture file for INT32 column
+        let f = get_fixture_file("single_int32.parquet");
+        let array = read_record_from_page(f, 0, 0, 0).unwrap().unwrap();
+        assert!(!array.is_empty(), "should read some values");
+
+        // Verify values start at 0 (fixture generates sequential integers)
+        assert_eq!(array.value(0), 0, "first value should be 0");
+    }
+
+    #[test]
+    fn test_read_record_from_page_string_fixture() {
+        // Test with fixture file for string column
+        let f = get_fixture_file("single_string.parquet");
+        let array = read_record_from_page_string(f, 0, 0, 0).unwrap().unwrap();
+        assert!(array.len() > 0, "should read some values");
+    }
+
+    // --- get_page_by_location tests ---
+
+    #[test]
+    fn test_get_page_by_location_direct() {
+        // Test get_page_by_location by manually providing a page location
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file.try_clone().unwrap()).unwrap().unwrap();
+
+        let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+        let row_group_reader = file_reader.get_row_group(0).unwrap();
+        let column_meta = row_group_reader.metadata().column(0);
+
+        let page_location = locs[0][0][0].clone();
+        let page = get_page_by_location(file, page_location, column_meta).unwrap().unwrap();
+        assert_eq!(page.page_type(), PageType::DATA_PAGE);
+        assert!(page.num_values() > 0);
+    }
+
+    // --- Cross-function integration tests ---
+
+    #[test]
+    fn test_single_int32_file_end_to_end() {
+        // End-to-end: get locations -> shuffle -> read all pages -> verify total rows
+        let file = get_fixture_file("single_int32.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let shuffled = generate_random_page_indices_file_level(locs, 0).unwrap();
+
+        let mut total_rows = 0;
+        for &(rg_idx, page_idx) in &shuffled {
+            let f = get_fixture_file("single_int32.parquet");
+            let (array, row_count) = read_page_with_row_count(f, rg_idx, 0, page_idx).unwrap();
+            assert_eq!(array.len(), row_count);
+            total_rows += row_count;
+        }
+        // 2 row groups x 2000 rows
+        assert_eq!(total_rows, 4000, "should read all 4000 rows");
+    }
+
+    #[test]
+    fn test_multi_column_end_to_end_all_rows_unique() {
+        // End-to-end: verify all rows are read exactly once across shuffled pages
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let shuffled = generate_shuffled_multi_column_indices_file_level(&locs, 0).unwrap();
+
+        let mut all_ids = Vec::new();
+        for &(rg_idx, page_idx) in &shuffled {
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, rg_idx, &[0, 1, 2], page_idx).unwrap();
+
+            let int32_array = results[0].0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let str_array = results[1].0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+            let int64_array = results[2].0.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+
+            for i in 0..int32_array.len() {
+                let id = int32_array.value(i);
+                let name = str_array.value(i);
+                let score = int64_array.value(i);
+
+                // Verify alignment
+                assert_eq!(name, format!("item_{:06}", id));
+                assert_eq!(score, id as i64 * 100);
+
+                all_ids.push(id);
+            }
+        }
+
+        // Sort and verify all IDs 0..4000 are present exactly once
+        all_ids.sort();
+        assert_eq!(all_ids.len(), 4000);
+        for (i, &id) in all_ids.iter().enumerate() {
+            assert_eq!(id, i as i32, "missing or duplicate id at position {}", i);
+        }
     }
 }
