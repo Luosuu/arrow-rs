@@ -851,6 +851,84 @@ pub fn generate_shuffled_multi_column_indices_dataset_level(
     Ok(random_page_indices)
 }
 
+/// Reads an arbitrary range of rows `[start_row, end_row)` from a single column
+/// in a given row group.
+///
+/// Uses page metadata (`PageLocation.first_row_index`) to find the overlapping pages,
+/// reads them via `read_page_with_row_count`, slices to the exact row range, and
+/// concatenates sliced arrays.
+///
+/// Supports INT32, INT64, FLOAT, BYTE_ARRAY (string and binary) physical types.
+/// For LIST<FLOAT32> columns, this function reads the **element** column and returns
+/// the flat float values in the range; use `read_list_float_page` for list-aware reads.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - Zero-based index of the row group to read from.
+/// * `column_idx` - Zero-based index of the column to read.
+/// * `start_row` - The inclusive start row within the row group.
+/// * `end_row` - The exclusive end row within the row group.
+///
+/// # Returns
+/// A tuple of `(Arc<dyn Array>, usize)` containing the sliced array and the number
+/// of rows read (`end_row - start_row`).
+///
+/// # Errors
+/// Returns `ParquetError` if the file lacks offset indexes, the row range is out of
+/// bounds, or decoding fails.
+pub fn read_row_range(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+) -> Result<(Arc<dyn Array>, usize)> {
+    if start_row >= end_row {
+        return Err(ParquetError::General(format!(
+            "Invalid row range: start_row ({}) must be less than end_row ({})",
+            start_row, end_row
+        )));
+    }
+
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    if end_row > num_rows_in_rg {
+        return Err(ParquetError::General(format!(
+            "end_row ({}) exceeds row group size ({})",
+            end_row, num_rows_in_rg
+        )));
+    }
+
+    let row_group_reader = file_reader.get_row_group(row_group_idx)?;
+    #[allow(deprecated)]
+    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+        .ok_or_else(|| {
+            ParquetError::General(
+                "Offset index not available; file must be written with write_page_index=True"
+                    .to_string(),
+            )
+        })?;
+
+    let col_pages: Vec<PageLocation> = offset_indexes[column_idx].page_locations().clone();
+
+    let array = read_rows_from_column(
+        &file,
+        row_group_idx,
+        column_idx,
+        &col_pages,
+        start_row,
+        end_row,
+        num_rows_in_rg,
+        parquet_metadata,
+    )?;
+
+    let row_count = end_row - start_row;
+    Ok((array, row_count))
+}
+
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
 #[allow(clippy::too_many_arguments)]
@@ -924,7 +1002,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -2158,5 +2236,170 @@ mod tests {
             "first state value in rg1 should be ~{}, got {}",
             expected_first, float_array.value(0)
         );
+    }
+
+    // ========================================================================
+    // Tests for read_row_range
+    // ========================================================================
+
+    #[test]
+    fn test_read_row_range_first_10_rows_int32() {
+        // Read rows 0-10 from INT32 column in multi_column.parquet
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 0, 10).unwrap();
+
+        assert_eq!(row_count, 10);
+        assert_eq!(array.len(), 10);
+
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        // Data pattern: col0 (id) = row_idx
+        for i in 0..10 {
+            assert_eq!(int_array.value(i), i as i32);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_spanning_page_boundaries() {
+        // multi_column.parquet has 2000 rows per RG, page_size=256, PLAIN encoding
+        // INT32 pages hold ~64 values each (256 bytes / 4 bytes per i32)
+        // Reading rows 50-150 should span multiple pages
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 50, 150).unwrap();
+
+        assert_eq!(row_count, 100);
+        assert_eq!(array.len(), 100);
+
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        for i in 0..100 {
+            assert_eq!(int_array.value(i), (50 + i) as i32);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_last_n_rows() {
+        // Read the last 20 rows of row group 0 (rows 1980-2000)
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 1980, 2000).unwrap();
+
+        assert_eq!(row_count, 20);
+        assert_eq!(array.len(), 20);
+
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        for i in 0..20 {
+            assert_eq!(int_array.value(i), (1980 + i) as i32);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_int64() {
+        // Read INT64 column (col 2, score = row_idx * 100)
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 2, 10, 20).unwrap();
+
+        assert_eq!(row_count, 10);
+        let int64_array = array.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        for i in 0..10 {
+            assert_eq!(int64_array.value(i), (10 + i) as i64 * 100);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_string() {
+        // Read String column (col 1, name = "item_{row_idx:06d}")
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 1, 5, 8).unwrap();
+
+        assert_eq!(row_count, 3);
+        let str_array = array.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(str_array.value(0), "item_000005");
+        assert_eq!(str_array.value(1), "item_000006");
+        assert_eq!(str_array.value(2), "item_000007");
+    }
+
+    #[test]
+    fn test_read_row_range_row_group_1() {
+        // Read from row group 1 — data pattern continues with row_idx offset
+        // In RG1, id values start at 2000
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 1, 0, 0, 5).unwrap();
+
+        assert_eq!(row_count, 5);
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        for i in 0..5 {
+            assert_eq!(int_array.value(i), (2000 + i) as i32);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_single_row() {
+        // Read exactly one row
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 42, 43).unwrap();
+
+        assert_eq!(row_count, 1);
+        assert_eq!(array.len(), 1);
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        assert_eq!(int_array.value(0), 42);
+    }
+
+    #[test]
+    fn test_read_row_range_invalid_range() {
+        let file = get_fixture_file("multi_column.parquet");
+        let result = read_row_range(file, 0, 0, 10, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_row_range_out_of_bounds() {
+        let file = get_fixture_file("multi_column.parquet");
+        let result = read_row_range(file, 0, 0, 1990, 2010);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_row_range_libero_binary() {
+        // Read binary (image bytes) column from libero fixture
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 0, 5).unwrap();
+
+        assert_eq!(row_count, 5);
+        assert_eq!(array.len(), 5);
+        // Column 0 is image.bytes (binary)
+        let bin_array = array.as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+        // Each value should be valid PNG bytes (starts with PNG signature)
+        for i in 0..5 {
+            let bytes = bin_array.value(i);
+            assert!(bytes.len() > 8, "image bytes should be non-trivial");
+            assert_eq!(&bytes[..4], b"\x89PNG", "should be valid PNG");
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_libero_list_float() {
+        // Read LIST<FLOAT32> element column (state) from libero fixture
+        // Column 2 is the state list element column (FLOAT physical type)
+        // This reads raw float elements, not reconstructed lists
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_row_range(file, 0, 2, 0, 10).unwrap();
+
+        // For list element columns, row_count is still end_row - start_row
+        assert_eq!(row_count, 10);
+        // But array.len() may differ since each "row" in the element column
+        // is a single float, while read_rows_from_column slices by element position
+        assert!(array.len() > 0);
+    }
+
+    #[test]
+    fn test_read_row_range_all_rows_in_rg() {
+        // Read all 2000 rows from row group 0
+        let file = get_fixture_file("multi_column.parquet");
+        let (array, row_count) = read_row_range(file, 0, 0, 0, 2000).unwrap();
+
+        assert_eq!(row_count, 2000);
+        assert_eq!(array.len(), 2000);
+
+        let int_array = array.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        assert_eq!(int_array.value(0), 0);
+        assert_eq!(int_array.value(1999), 1999);
     }
 }
