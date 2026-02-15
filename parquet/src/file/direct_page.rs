@@ -16,12 +16,13 @@ use crate::compression::{create_codec, Codec};
 use crate::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
-use crate::file::page_index::index_reader::read_pages_locations;
+use crate::file::metadata::thrift::PageHeader;
+use crate::file::page_index::index_reader::read_offset_indexes;
+use crate::file::page_index::offset_index::PageLocation;
 use crate::file::properties::ReaderProperties;
 use crate::file::reader::*;
 use crate::file::serialized_reader::decode_page;
-use crate::format::{PageHeader, PageLocation};
-use crate::thrift::{TCompactSliceInputProtocol, TSerializable};
+use crate::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::util::test_common::page_util::InMemoryPageReader;
 
 pub fn get_file_page_locations(file: File) -> Result<Option<Vec<Vec<Vec<PageLocation>>>>> {
@@ -29,10 +30,18 @@ pub fn get_file_page_locations(file: File) -> Result<Option<Vec<Vec<Vec<PageLoca
     let file_reader = SerializedFileReader::new(file_clone).unwrap();
     let num_row_groups = file_reader.num_row_groups();
     let mut file_page_locations = Vec::new();
+    #[allow(deprecated)]
     for row_group_idx in 0..num_row_groups {
         let row_group_reader = file_reader.get_row_group(row_group_idx)?;
-        let page_locations = read_pages_locations(&file, row_group_reader.metadata().columns())?;
-        file_page_locations.push(page_locations)
+        let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?;
+        // Convert from Vec<OffsetIndexMetaData> to Vec<Vec<PageLocation>>
+        let page_locations = offset_indexes.map(|indexes| {
+            indexes
+                .into_iter()
+                .map(|idx| idx.page_locations().clone())
+                .collect()
+        });
+        file_page_locations.push(page_locations.unwrap_or_default())
     }
 
     Ok(Some(file_page_locations)) // 3 dim, row_group x column x page
@@ -123,8 +132,8 @@ pub fn get_page_by_location(
             page_location.compressed_page_size as usize,
         )
         .unwrap();
-    let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
-    let page_header = PageHeader::read_from_in_protocol(&mut prot).unwrap();
+    let mut prot = ThriftSliceInputProtocol::new(buffer.as_ref());
+    let page_header = PageHeader::read_thrift(&mut prot).unwrap();
     let offset = buffer.len() - prot.as_slice().len();
 
     let bytes = buffer.slice(offset..);
@@ -152,8 +161,12 @@ pub fn get_page_by_idx(
     // let _page_reader = row_group_reader.get_column_page_reader(column_idx).unwrap();
 
     // Get the page location for the specified column and page index
-    let page_locations = read_pages_locations(&file, row_group_reader.metadata().columns())?;
-    let page_location = &page_locations[column_idx][page_idx];
+    #[allow(deprecated)]
+    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?;
+    let page_locations = offset_indexes
+        .as_ref()
+        .unwrap();
+    let page_location = &page_locations[column_idx].page_locations()[page_idx];
     // buffer
     let buffer = file
         .get_bytes(
@@ -161,8 +174,8 @@ pub fn get_page_by_idx(
             page_location.compressed_page_size as usize,
         )
         .unwrap();
-    let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
-    PageHeader::read_from_in_protocol(&mut prot).unwrap();
+    let mut prot = ThriftSliceInputProtocol::new(buffer.as_ref());
+    PageHeader::read_thrift(&mut prot).unwrap();
     let offset = buffer.len() - prot.as_slice().len();
 
     buffer.slice(offset..);
@@ -451,17 +464,13 @@ mod tests {
 
     #[test]
     fn test_file_page_num() {
-        // let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
-        let testdata = arrow::util::test_util::parquet_test_data();
-        // let path = format!("{testdata}/int32_with_null_pages.parquet");
-        let path = format!("{testdata}/data-pq-string-test.parquet");
-        let test_file = File::open(path).unwrap();
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
 
         let page_locations = get_file_page_locations(test_file.try_clone().unwrap())
             .unwrap()
             .unwrap();
         let page_num = page_locations[0].len();
-        println!("the first row group contains {page_num} pages."); // 13
+        println!("the first row group contains {page_num} pages.");
         assert_ne!(page_num, 0);
     }
 
@@ -534,28 +543,25 @@ mod tests {
 
     #[test]
     fn test_read_page_into_batch() {
-        let testdata = arrow::util::test_util::parquet_test_data();
-        // let path = format!("{testdata}/int32_with_null_pages.parquet");
-        let path = format!("{testdata}/data-pq-00000-int32.parquet");
-        let test_file = File::open(path).unwrap();
+        // alltypes_tiny_pages_plain.parquet has INT32 data in column 0 (id)
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
 
         let row_group_idx = 0;
         let column_idx = 0;
-        let page_idx = 1;
+        let page_idx = 0;
 
         let array = read_record_from_page(test_file, row_group_idx, column_idx, page_idx)
             .unwrap()
             .unwrap();
+        assert!(array.len() > 0);
     }
     #[test]
     fn test_read_string_page_into_batch() {
-        let testdata = arrow::util::test_util::parquet_test_data();
-        // let path = format!("{testdata}/int32_with_null_pages.parquet");
-        let path = format!("{testdata}/data-pq-string-test.parquet");
-        let test_file = File::open(path).unwrap();
+        // alltypes_tiny_pages_plain.parquet has BYTE_ARRAY (string) data at column 9 (string_col)
+        let test_file = get_test_file("alltypes_tiny_pages_plain.parquet");
 
         let row_group_idx = 0;
-        let column_idx = 0;
+        let column_idx = 9;
         let page_idx = 0;
 
         let array = read_record_from_page_string(test_file, row_group_idx, column_idx, page_idx)
