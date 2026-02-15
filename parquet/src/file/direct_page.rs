@@ -14,7 +14,7 @@ use crate::column::reader::{ColumnReader, get_column_reader, get_typed_column_re
 use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
 use crate::compression::create_codec;
 use crate::basic::{ConvertedType, Type as PhysicalType};
-use crate::data_type::{ByteArrayType, Int32Type, Int64Type};
+use crate::data_type::{ByteArrayType, FloatType, Int32Type, Int64Type};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
 use crate::file::metadata::thrift::PageHeader;
@@ -521,11 +521,119 @@ pub fn read_page_with_row_count(
                 Ok((Arc::new(array) as Arc<dyn Array>, values_read))
             }
         }
+        PhysicalType::FLOAT => {
+            let mut record_reader: GenericRecordReader<Vec<f32>, ColumnValueDecoderImpl<FloatType>> =
+                RecordReader::<FloatType>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Float32Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
         _ => Err(ParquetError::General(format!(
             "Unsupported physical type {:?} for read_page_with_row_count",
             physical_type
         ))),
     }
+}
+
+/// Reads a page from a LIST<FLOAT32> column and returns the data as an Arrow
+/// `ListArray<Float32>`, reconstructing list boundaries from the Parquet
+/// repetition and definition levels.
+///
+/// The Parquet schema for `list<float32>` stores float values in a leaf column
+/// with repetition level 1 (items within the same list) and definition levels
+/// encoding nullability. This function reads the raw float values along with
+/// their rep/def levels and rebuilds the list structure.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - The zero-based index of the row group to read from.
+/// * `column_idx` - The zero-based index of the **leaf** column (the float
+///   element inside the list).
+/// * `page_idx` - The zero-based page index within the column chunk.
+///
+/// # Returns
+/// A tuple of `(Arc<dyn Array>, usize)` where the array is a `ListArray<Float32>`
+/// and `usize` is the number of **rows** (lists), not the number of float elements.
+///
+/// # Errors
+/// Returns `ParquetError` if the column is not a FLOAT type or decoding fails.
+pub fn read_list_float_page(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    page_idx: usize,
+) -> Result<(Arc<dyn Array>, usize)> {
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap()).unwrap();
+    let parquet_metadata = file_reader.metadata();
+
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)?
+        .ok_or_else(|| {
+            ParquetError::General(format!(
+                "No page found for row_group={}, column={}, page={}",
+                row_group_idx, column_idx, page_idx
+            ))
+        })?;
+
+    let mut record_reader: GenericRecordReader<Vec<f32>, ColumnValueDecoderImpl<FloatType>> =
+        RecordReader::<FloatType>::new(column_desc.clone());
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+    record_reader.set_page_reader(page_reader)?;
+    let num_to_read = page.num_values() as usize;
+    record_reader.read_records(num_to_read)?;
+
+    let values = record_reader.consume_record_data();
+    let rep_levels = record_reader.consume_rep_levels();
+    let def_levels = record_reader.consume_def_levels();
+
+    // Reconstruct ListArray from values + rep/def levels
+    // rep_level=0 means start of a new top-level row (new list)
+    // rep_level=1 means continuation within the same list
+    let rep = rep_levels.unwrap_or_default();
+
+    let max_def_level = column_desc.max_def_level();
+
+    // Build offsets: each rep_level=0 starts a new list
+    let mut offsets: Vec<i32> = Vec::new();
+    let mut cur_offset: i32 = 0;
+    let mut num_rows = 0;
+
+    if !rep.is_empty() {
+        for (i, &r) in rep.iter().enumerate() {
+            if r == 0 {
+                offsets.push(cur_offset);
+                num_rows += 1;
+            }
+            // Only count values where def_level equals max_def_level (value is present)
+            if let Some(ref dl) = def_levels {
+                if dl[i] == max_def_level {
+                    cur_offset += 1;
+                }
+            } else {
+                cur_offset += 1;
+            }
+        }
+    }
+    offsets.push(cur_offset);
+
+    // Build the Float32Array from the actual values (already null-padded by RecordReader)
+    let float_array = arrow_array::Float32Array::from(values);
+
+    // Build the ListArray
+    let offsets_array = arrow_array::Int32Array::from(offsets);
+    let offsets_buffer = arrow_buffer::OffsetBuffer::new(offsets_array.into_parts().1);
+    let list_field = Arc::new(arrow_schema::Field::new("element", arrow_schema::DataType::Float32, true));
+    let list_array = arrow_array::ListArray::new(list_field, offsets_buffer, Arc::new(float_array), None);
+
+    Ok((Arc::new(list_array) as Arc<dyn Array>, num_rows))
 }
 
 /// Reads aligned data from multiple columns for a given row group, returning arrays
@@ -621,14 +729,22 @@ pub fn read_multi_column_aligned(
             num_rows_in_rg,
             parquet_metadata,
         )?;
-        assert_eq!(
-            array.len(),
-            target_row_count,
-            "column {} produced {} rows but expected {}",
-            col_idx,
-            array.len(),
-            target_row_count
-        );
+        // For nested (list) columns, array.len() is the number of elements
+        // which can exceed target_row_count. Only assert for flat columns.
+        let col_desc = parquet_metadata
+            .file_metadata()
+            .schema_descr_ptr()
+            .column(col_idx);
+        if col_desc.max_rep_level() == 0 {
+            assert_eq!(
+                array.len(),
+                target_row_count,
+                "column {} produced {} rows but expected {}",
+                col_idx,
+                array.len(),
+                target_row_count
+            );
+        }
         results.push((array, target_row_count));
     }
 
@@ -811,6 +927,7 @@ fn read_rows_from_column(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use std::sync::Arc;
 
     use arrow_array::Array as _;
     use arrow_cast::pretty::print_batches;
@@ -1871,5 +1988,184 @@ mod tests {
         let str_array = results[1].0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
         assert!(str_array.value(0).starts_with("frame_"),
             "path should start with 'frame_', got '{}'", str_array.value(0));
+    }
+
+    // ==================== LIST<FLOAT32> column tests for US-004 ====================
+
+    #[test]
+    fn test_read_float_column_from_libero_fixture() {
+        // Libero fixture col 2 = observation.state element (FLOAT physical type)
+        // For list columns, array.len() > row_count because array holds all elements
+        // while row_count reflects the number of top-level records.
+        let file = get_libero_fixture();
+        let (array, row_count) = read_page_with_row_count(file, 0, 2, 0).unwrap();
+
+        assert!(row_count > 0, "should read some records");
+        // For list<float32> with 8 elements per row, array has 8x more elements than rows
+        assert!(array.len() >= row_count,
+            "array.len()={} should be >= row_count={}", array.len(), row_count);
+        assert_eq!(
+            array.data_type(),
+            &arrow_schema::DataType::Float32,
+            "FLOAT physical type should produce Float32Array"
+        );
+    }
+
+    #[test]
+    fn test_read_list_float_page_state_column() {
+        // Libero fixture col 2 = observation.state list element (FLOAT)
+        // State has 8 floats per frame, 50 frames in row group 0
+        let file = get_libero_fixture();
+        let (array, num_rows) = super::read_list_float_page(file, 0, 2, 0).unwrap();
+
+        assert!(num_rows > 0, "should have at least one row (list)");
+        assert_eq!(
+            array.data_type(),
+            &arrow_schema::DataType::List(
+                Arc::new(arrow_schema::Field::new("element", arrow_schema::DataType::Float32, true))
+            ),
+            "should produce ListArray<Float32>"
+        );
+
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), num_rows);
+
+        // Each list should have 8 elements (state dimension)
+        for i in 0..list_array.len() {
+            let inner = list_array.value(i);
+            assert_eq!(inner.len(), 8,
+                "row {} state should have 8 elements, got {}", i, inner.len());
+        }
+    }
+
+    #[test]
+    fn test_read_list_float_page_action_column() {
+        // Libero fixture col 3 = action list element (FLOAT)
+        // Action has 7 floats per frame
+        let file = get_libero_fixture();
+        let (array, num_rows) = super::read_list_float_page(file, 0, 3, 0).unwrap();
+
+        assert!(num_rows > 0);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+
+        // Each list should have 7 elements (action dimension)
+        for i in 0..list_array.len() {
+            let inner = list_array.value(i);
+            assert_eq!(inner.len(), 7,
+                "row {} action should have 7 elements, got {}", i, inner.len());
+        }
+    }
+
+    #[test]
+    fn test_read_list_float_page_state_values_correctness() {
+        // Verify actual float values match the fixture generation formula:
+        // state[i] = episode_idx * 0.1 + frame_idx * 0.01 + element_idx * 0.001
+        // Row group 0 = episode 0
+        let file = get_libero_fixture();
+        let (array, num_rows) = super::read_list_float_page(file, 0, 2, 0).unwrap();
+
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+
+        let episode_idx = 0;
+        for frame_idx in 0..num_rows {
+            let inner = list_array.value(frame_idx);
+            let float_array = inner.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+            for elem_idx in 0..8 {
+                let expected = episode_idx as f32 * 0.1 + frame_idx as f32 * 0.01 + elem_idx as f32 * 0.001;
+                let actual = float_array.value(elem_idx);
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "state[{}][{}] = {} but expected {}",
+                    frame_idx, elem_idx, actual, expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_list_float_page_all_pages_row_count() {
+        // Sum row counts across all pages of state column to verify total
+        let file = get_libero_fixture();
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for rg_idx in 0..locs.len() {
+            let num_pages = locs[rg_idx][2].len();
+            let mut total_rows = 0;
+            for page_idx in 0..num_pages {
+                let f = get_libero_fixture();
+                let (array, num_rows) = super::read_list_float_page(f, rg_idx, 2, page_idx).unwrap();
+                let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+                assert_eq!(list_array.len(), num_rows);
+                total_rows += num_rows;
+            }
+            assert_eq!(total_rows, 50,
+                "row group {} should have 50 rows (frames)", rg_idx);
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_float_columns_only() {
+        // Read two FLOAT list element columns together (state col 2, action col 3).
+        // Both are list element columns with the same number of rows, so they
+        // should align correctly (even though element counts differ: 8 vs 7 per row).
+        let file = get_libero_fixture();
+        let results = read_multi_column_aligned(file, 0, &[2, 3], 0).unwrap();
+
+        assert_eq!(results.len(), 2);
+
+        // Both should have the same row_count (top-level records)
+        let row_count = results[0].1;
+        assert!(row_count > 0);
+        assert_eq!(results[1].1, row_count, "both columns should report same row count");
+
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Float32,
+            "col 2 (state element) should be Float32");
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Float32,
+            "col 3 (action element) should be Float32");
+
+        // State has 8 elements per row, action has 7
+        // Total elements: row_count * 8 for state, row_count * 7 for action
+        assert_eq!(results[0].0.len(), row_count * 8,
+            "state should have 8 elements per row");
+        assert_eq!(results[1].0.len(), row_count * 7,
+            "action should have 7 elements per row");
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_non_list_columns() {
+        // Read only non-list columns from Libero fixture (INT64 columns)
+        // col 4 = frame_index, col 5 = episode_index
+        let file = get_libero_fixture();
+        let results = read_multi_column_aligned(file, 0, &[4, 5], 0).unwrap();
+
+        assert_eq!(results.len(), 2);
+        let row_count = results[0].1;
+        assert!(row_count > 0);
+        assert_eq!(results[1].1, row_count);
+        assert_eq!(results[0].0.len(), row_count);
+        assert_eq!(results[1].0.len(), row_count);
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Int64);
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Int64);
+    }
+
+    #[test]
+    fn test_read_list_float_page_row_group_1() {
+        // Verify list reading works for row group 1 (episode 1)
+        let file = get_libero_fixture();
+        let (array, num_rows) = super::read_list_float_page(file, 1, 2, 0).unwrap();
+
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert!(num_rows > 0);
+
+        // First frame in row group 1: episode_idx=1, frame_idx=0
+        // state[0] = 1.0 * 0.1 + 0 * 0.01 + 0 * 0.001 = 0.1
+        let first_list = list_array.value(0);
+        let float_array = first_list.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+        let expected_first = 1.0_f32 * 0.1;
+        assert!(
+            (float_array.value(0) - expected_first).abs() < 1e-5,
+            "first state value in rg1 should be ~{}, got {}",
+            expected_first, float_array.value(0)
+        );
     }
 }
