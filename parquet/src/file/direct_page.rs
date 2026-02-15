@@ -637,6 +637,112 @@ pub fn read_multi_column_aligned(
     Ok(results)
 }
 
+/// Generates shuffled page indices for multi-column aligned reading at the file level.
+///
+/// Unlike `generate_random_page_indices_file_level` which shuffles pages for a single
+/// column, this function generates indices suitable for use with `read_multi_column_aligned`.
+/// Pages are shuffled across all row groups in the file, where each index refers to a
+/// page of the **reference column** (the first column in the column list passed to
+/// `read_multi_column_aligned`).
+///
+/// # Arguments
+/// * `file_page_locations` - Page locations for all row groups and columns, as returned
+///   by `get_file_page_locations`. Shape: `[row_group][column][page]`.
+/// * `reference_column_idx` - The column index used as the reference for page boundaries.
+///   This should match the first element of `column_indices` passed to
+///   `read_multi_column_aligned`.
+///
+/// # Returns
+/// A shuffled `Vec<(usize, usize)>` of `(row_group_idx, page_idx)` pairs, where
+/// `page_idx` refers to a page in the reference column.
+pub fn generate_shuffled_multi_column_indices_file_level(
+    file_page_locations: &Vec<Vec<Vec<PageLocation>>>,
+    reference_column_idx: usize,
+) -> Result<Vec<(usize, usize)>> {
+    // This is functionally identical to generate_random_page_indices_file_level
+    // because multi-column alignment is handled at read time by read_multi_column_aligned.
+    // We shuffle pages of the reference column; other columns are aligned automatically.
+    let num_row_groups = file_page_locations.len();
+    let mut page_num_offsets = Vec::new();
+    let mut total_page_num = 0;
+
+    for row_group_idx in 0..num_row_groups {
+        page_num_offsets.push(total_page_num);
+        total_page_num += file_page_locations[row_group_idx][reference_column_idx].len();
+    }
+
+    let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
+    page_random_indices.shuffle(&mut thread_rng());
+
+    let mut random_rg_page_indices_pairs = Vec::new();
+    for &page_random_index in &page_random_indices {
+        let row_group_idx = page_num_offsets
+            .binary_search(&page_random_index)
+            .unwrap_or_else(|idx| idx - 1);
+        let page_idx = page_random_index - page_num_offsets[row_group_idx];
+        random_rg_page_indices_pairs.push((row_group_idx, page_idx));
+    }
+    Ok(random_rg_page_indices_pairs)
+}
+
+/// Generates shuffled page indices for multi-column aligned reading at the dataset level.
+///
+/// This extends `generate_shuffled_multi_column_indices_file_level` across multiple files,
+/// producing shuffled `(file_idx, row_group_idx, page_idx)` triples suitable for use
+/// with `read_multi_column_aligned`.
+///
+/// # Arguments
+/// * `dataset_page_locations` - Page locations for all files, row groups, and columns.
+///   Shape: `[file][row_group][column][page]`.
+/// * `reference_column_idx` - The column index used as the reference for page boundaries.
+///
+/// # Returns
+/// A shuffled `Vec<(usize, usize, usize)>` of `(file_idx, row_group_idx, page_idx)` triples.
+pub fn generate_shuffled_multi_column_indices_dataset_level(
+    dataset_page_locations: &Vec<Vec<Vec<Vec<PageLocation>>>>,
+    reference_column_idx: usize,
+) -> Result<Vec<(usize, usize, usize)>> {
+    let num_files = dataset_page_locations.len();
+    let mut page_num_offsets_across_file = Vec::new();
+    let mut page_num_offsets_within_file = Vec::new();
+    let mut total_page_num = 0;
+
+    for file_idx in 0..num_files {
+        let this_file_num_row_groups = dataset_page_locations[file_idx].len();
+        let mut this_file_page_num_offsets = Vec::new();
+        let mut this_file_page_num = 0;
+
+        for row_group_idx in 0..this_file_num_row_groups {
+            this_file_page_num_offsets.push(this_file_page_num);
+            this_file_page_num +=
+                dataset_page_locations[file_idx][row_group_idx][reference_column_idx].len();
+        }
+
+        page_num_offsets_within_file.push(this_file_page_num_offsets);
+        page_num_offsets_across_file.push(total_page_num);
+        total_page_num += this_file_page_num;
+    }
+
+    let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
+    page_random_indices.shuffle(&mut thread_rng());
+
+    let mut random_page_indices = Vec::new();
+    for &page_random_index in &page_random_indices {
+        let file_idx = page_num_offsets_across_file
+            .binary_search(&page_random_index)
+            .unwrap_or_else(|idx| idx - 1);
+        let page_offset_within_file = page_random_index - page_num_offsets_across_file[file_idx];
+        let row_group_idx = page_num_offsets_within_file[file_idx]
+            .binary_search(&page_offset_within_file)
+            .unwrap_or_else(|idx| idx - 1);
+        let page_idx =
+            page_offset_within_file - page_num_offsets_within_file[file_idx][row_group_idx];
+        random_page_indices.push((file_idx, row_group_idx, page_idx));
+    }
+
+    Ok(random_page_indices)
+}
+
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
 fn read_rows_from_column(
@@ -711,7 +817,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -1080,5 +1186,139 @@ mod tests {
                 v32
             );
         }
+    }
+
+    #[test]
+    fn test_shuffled_multi_column_file_level_covers_all_pages() {
+        // Shuffled indices should cover every page of the reference column exactly once
+        let file = get_fixture_file("multi_column.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let ref_col = 0;
+        let shuffled = generate_shuffled_multi_column_indices_file_level(&page_locations, ref_col)
+            .unwrap();
+
+        // Total pages across all row groups for the reference column
+        let total_pages: usize = page_locations.iter()
+            .map(|rg| rg[ref_col].len())
+            .sum();
+        assert_eq!(shuffled.len(), total_pages, "should have one entry per page");
+
+        // Every (rg, page) pair should appear exactly once
+        let mut seen = std::collections::HashSet::new();
+        for &(rg_idx, page_idx) in &shuffled {
+            assert!(rg_idx < page_locations.len(), "rg_idx out of range");
+            assert!(page_idx < page_locations[rg_idx][ref_col].len(), "page_idx out of range");
+            assert!(seen.insert((rg_idx, page_idx)), "duplicate index ({}, {})", rg_idx, page_idx);
+        }
+        assert_eq!(seen.len(), total_pages);
+    }
+
+    #[test]
+    fn test_shuffled_multi_column_file_level_aligned_reads() {
+        // Use shuffled indices with read_multi_column_aligned and verify all rows are read
+        // with correct alignment (INT64 = INT32 * 100)
+        let file = get_fixture_file("multi_column.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let ref_col = 0;
+        let shuffled = generate_shuffled_multi_column_indices_file_level(&page_locations, ref_col)
+            .unwrap();
+
+        let mut total_rows = 0;
+        for &(rg_idx, page_idx) in &shuffled {
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, rg_idx, &[0, 1, 2], page_idx).unwrap();
+
+            let row_count = results[0].1;
+            assert!(row_count > 0);
+            // All columns must have the same row count
+            for (_, rc) in &results {
+                assert_eq!(*rc, row_count);
+            }
+
+            // Verify alignment: INT64 = INT32 * 100
+            let int32_array = results[0].0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let int64_array = results[2].0.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            for i in 0..int32_array.len() {
+                assert_eq!(int64_array.value(i), int32_array.value(i) as i64 * 100);
+            }
+
+            total_rows += row_count;
+        }
+        // 2 row groups x 2000 rows = 4000 total rows
+        assert_eq!(total_rows, 4000, "shuffled reads should cover all rows");
+    }
+
+    #[test]
+    fn test_shuffled_multi_column_dataset_level_covers_all_pages() {
+        // Dataset-level shuffling across multiple "files" (same file used 3 times)
+        let file0 = get_fixture_file("multi_column.parquet");
+        let file1 = get_fixture_file("multi_column.parquet");
+        let file2 = get_fixture_file("multi_column.parquet");
+
+        let locs0 = get_file_page_locations(file0).unwrap().unwrap();
+        let locs1 = get_file_page_locations(file1).unwrap().unwrap();
+        let locs2 = get_file_page_locations(file2).unwrap().unwrap();
+
+        let dataset_locations = vec![locs0, locs1, locs2];
+        let ref_col = 0;
+        let shuffled = generate_shuffled_multi_column_indices_dataset_level(&dataset_locations, ref_col)
+            .unwrap();
+
+        // Total pages across all files
+        let total_pages: usize = dataset_locations.iter()
+            .flat_map(|file_locs| file_locs.iter())
+            .map(|rg| rg[ref_col].len())
+            .sum();
+        assert_eq!(shuffled.len(), total_pages);
+
+        // Every (file, rg, page) triple should appear exactly once
+        let mut seen = std::collections::HashSet::new();
+        for &(file_idx, rg_idx, page_idx) in &shuffled {
+            assert!(file_idx < dataset_locations.len());
+            assert!(rg_idx < dataset_locations[file_idx].len());
+            assert!(page_idx < dataset_locations[file_idx][rg_idx][ref_col].len());
+            assert!(seen.insert((file_idx, rg_idx, page_idx)),
+                "duplicate index ({}, {}, {})", file_idx, rg_idx, page_idx);
+        }
+        assert_eq!(seen.len(), total_pages);
+    }
+
+    #[test]
+    fn test_shuffled_multi_column_dataset_level_aligned_reads() {
+        // Dataset-level: verify shuffled reads produce correct aligned data
+        let file = get_fixture_file("multi_column.parquet");
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        let dataset_locations = vec![locs.clone(), locs.clone()];
+        let ref_col = 0;
+        let shuffled = generate_shuffled_multi_column_indices_dataset_level(&dataset_locations, ref_col)
+            .unwrap();
+
+        let mut total_rows = 0;
+        for &(_, rg_idx, page_idx) in &shuffled {
+            // All files are the same, so we can read from any
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, rg_idx, &[0, 2], page_idx).unwrap();
+
+            let row_count = results[0].1;
+            assert_eq!(results[1].1, row_count);
+
+            // Verify alignment
+            let int32_array = results[0].0.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+            let int64_array = results[1].0.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+            for i in 0..int32_array.len() {
+                assert_eq!(int64_array.value(i), int32_array.value(i) as i64 * 100);
+            }
+
+            total_rows += row_count;
+        }
+        // 2 files x 2 row groups x 2000 rows = 8000 total rows
+        assert_eq!(total_rows, 8000, "dataset-level shuffled reads should cover all rows");
     }
 }
