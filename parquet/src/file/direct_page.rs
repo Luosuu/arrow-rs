@@ -70,13 +70,12 @@ pub fn generate_random_page_indices_file_level(
     file_page_locations: Vec<Vec<Vec<PageLocation>>>,
     column_idx: usize,
 ) -> Result<Vec<(usize, usize)>> {
-    let num_row_groups = file_page_locations.len();
     let mut page_num_offsets = Vec::new();
     let mut total_page_num = 0;
 
-    for row_group_idx in 0..num_row_groups {
+    for rg_pages in &file_page_locations {
         page_num_offsets.push(total_page_num);
-        total_page_num += file_page_locations[row_group_idx][column_idx].len();
+        total_page_num += rg_pages[column_idx].len();
     }
 
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
@@ -106,18 +105,16 @@ pub fn generate_random_page_indices_dataset_level(
     dataset_page_locations: Vec<Vec<Vec<Vec<PageLocation>>>>,
     column_idx: usize,
 ) -> Result<Vec<(usize, usize, usize)>> {
-    let num_files = dataset_page_locations.len();
     let mut page_num_offsets_across_file = Vec::new();
     let mut page_num_offsets_within_file = Vec::new();
     let mut total_page_num = 0;
-    for file_idx in 0..num_files {
-        let this_file_num_row_groups = dataset_page_locations[file_idx].len();
+    for file_pages in &dataset_page_locations {
         let mut this_file_page_num_offsets = Vec::new();
         let mut this_file_page_num = 0;
 
-        for row_group_idx in 0..this_file_num_row_groups {
+        for rg_pages in file_pages {
             this_file_page_num_offsets.push(this_file_page_num);
-            this_file_page_num += dataset_page_locations[file_idx][row_group_idx][column_idx].len();
+            this_file_page_num += rg_pages[column_idx].len();
         }
 
         page_num_offsets_within_file.push(this_file_page_num_offsets);
@@ -301,7 +298,7 @@ pub fn read_page_into_batch(
 
     let parquet_schema = parquet_metadata.file_metadata().schema_descr();
     let schema = parquet_to_arrow_schema(
-        &parquet_schema,
+        parquet_schema,
         parquet_metadata.file_metadata().key_value_metadata(),
     )
     .unwrap();
@@ -770,19 +767,18 @@ pub fn read_multi_column_aligned(
 /// A shuffled `Vec<(usize, usize)>` of `(row_group_idx, page_idx)` pairs, where
 /// `page_idx` refers to a page in the reference column.
 pub fn generate_shuffled_multi_column_indices_file_level(
-    file_page_locations: &Vec<Vec<Vec<PageLocation>>>,
+    file_page_locations: &[Vec<Vec<PageLocation>>],
     reference_column_idx: usize,
 ) -> Result<Vec<(usize, usize)>> {
     // This is functionally identical to generate_random_page_indices_file_level
     // because multi-column alignment is handled at read time by read_multi_column_aligned.
     // We shuffle pages of the reference column; other columns are aligned automatically.
-    let num_row_groups = file_page_locations.len();
     let mut page_num_offsets = Vec::new();
     let mut total_page_num = 0;
 
-    for row_group_idx in 0..num_row_groups {
+    for rg_pages in file_page_locations {
         page_num_offsets.push(total_page_num);
-        total_page_num += file_page_locations[row_group_idx][reference_column_idx].len();
+        total_page_num += rg_pages[reference_column_idx].len();
     }
 
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
@@ -813,23 +809,21 @@ pub fn generate_shuffled_multi_column_indices_file_level(
 /// # Returns
 /// A shuffled `Vec<(usize, usize, usize)>` of `(file_idx, row_group_idx, page_idx)` triples.
 pub fn generate_shuffled_multi_column_indices_dataset_level(
-    dataset_page_locations: &Vec<Vec<Vec<Vec<PageLocation>>>>,
+    dataset_page_locations: &[Vec<Vec<Vec<PageLocation>>>],
     reference_column_idx: usize,
 ) -> Result<Vec<(usize, usize, usize)>> {
-    let num_files = dataset_page_locations.len();
     let mut page_num_offsets_across_file = Vec::new();
     let mut page_num_offsets_within_file = Vec::new();
     let mut total_page_num = 0;
 
-    for file_idx in 0..num_files {
-        let this_file_num_row_groups = dataset_page_locations[file_idx].len();
+    for file_pages in dataset_page_locations {
         let mut this_file_page_num_offsets = Vec::new();
         let mut this_file_page_num = 0;
 
-        for row_group_idx in 0..this_file_num_row_groups {
+        for rg_pages in file_pages {
             this_file_page_num_offsets.push(this_file_page_num);
             this_file_page_num +=
-                dataset_page_locations[file_idx][row_group_idx][reference_column_idx].len();
+                rg_pages[reference_column_idx].len();
         }
 
         page_num_offsets_within_file.push(this_file_page_num_offsets);
@@ -859,6 +853,7 @@ pub fn generate_shuffled_multi_column_indices_dataset_level(
 
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
+#[allow(clippy::too_many_arguments)]
 fn read_rows_from_column(
     file: &File,
     row_group_idx: usize,
@@ -890,11 +885,7 @@ fn read_rows_from_column(
         let (page_array, _) = read_page_with_row_count(f, row_group_idx, col_idx, p_idx)?;
 
         // Compute the slice within this page that overlaps with [row_start, row_end)
-        let slice_start = if row_start > p_row_start {
-            row_start - p_row_start
-        } else {
-            0
-        };
+        let slice_start = row_start.saturating_sub(p_row_start);
         let slice_end = if row_end < p_row_end {
             row_end - p_row_start
         } else {
