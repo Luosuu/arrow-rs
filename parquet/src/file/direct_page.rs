@@ -13,7 +13,7 @@ use crate::column::page::Page;
 use crate::column::reader::{ColumnReader, get_column_reader, get_typed_column_reader};
 use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
 use crate::compression::create_codec;
-use crate::basic::Type as PhysicalType;
+use crate::basic::{ConvertedType, Type as PhysicalType};
 use crate::data_type::{ByteArrayType, Int32Type, Int64Type};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
@@ -484,7 +484,7 @@ pub fn read_page_with_row_count(
         }
         PhysicalType::BYTE_ARRAY => {
             let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
-            let column_reader: ColumnReader = get_column_reader(column_desc, page_reader);
+            let column_reader: ColumnReader = get_column_reader(column_desc.clone(), page_reader);
             let mut typed_reader = get_typed_column_reader::<ByteArrayType>(column_reader);
             let num_to_read = page.num_values() as usize;
             let mut values = Vec::new();
@@ -497,12 +497,29 @@ pub fn read_page_with_row_count(
                     Some(&mut rep_levels),
                     &mut values,
                 )?;
-            let str_values: Vec<Option<&str>> = values
-                .iter()
-                .map(|ba| Some(ba.as_utf8().unwrap()))
-                .collect();
-            let array = GenericByteArray::<Utf8Type>::from(str_values);
-            Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+
+            // Distinguish string vs binary by checking the logical/converted type
+            let is_string = column_desc.converted_type() == ConvertedType::UTF8
+                || matches!(
+                    column_desc.logical_type_ref(),
+                    Some(crate::basic::LogicalType::String)
+                );
+
+            if is_string {
+                let str_values: Vec<Option<&str>> = values
+                    .iter()
+                    .map(|ba| Some(ba.as_utf8().unwrap()))
+                    .collect();
+                let array = GenericByteArray::<Utf8Type>::from(str_values);
+                Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+            } else {
+                let bin_values: Vec<Option<&[u8]>> = values
+                    .iter()
+                    .map(|ba| Some(ba.data()))
+                    .collect();
+                let array = arrow_array::BinaryArray::from(bin_values);
+                Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+            }
         }
         _ => Err(ParquetError::General(format!(
             "Unsupported physical type {:?} for read_page_with_row_count",
@@ -1734,5 +1751,125 @@ mod tests {
         for (i, &id) in all_ids.iter().enumerate() {
             assert_eq!(id, i as i32, "missing or duplicate id at position {}", i);
         }
+    }
+
+    // ==================== Binary (BYTE_ARRAY) column tests for US-003 ====================
+
+    /// Helper to open the Libero fixture file.
+    fn get_libero_fixture() -> File {
+        get_fixture_file("libero_fixture.parquet")
+    }
+
+    #[test]
+    fn test_read_binary_column_from_libero_fixture() {
+        // Libero fixture col 0 = observation.images.image.bytes (BYTE_ARRAY, binary)
+        let file = get_libero_fixture();
+        let (array, row_count) = read_page_with_row_count(file, 0, 0, 0).unwrap();
+
+        assert!(row_count > 0, "should read some rows");
+        assert_eq!(array.len(), row_count);
+        assert_eq!(
+            array.data_type(),
+            &arrow_schema::DataType::Binary,
+            "binary BYTE_ARRAY should produce BinaryArray, not StringArray"
+        );
+
+        // Verify data is valid PNG bytes (starts with PNG signature)
+        let bin_array = array.as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+        let first_value = bin_array.value(0);
+        assert!(first_value.len() > 8, "PNG bytes should be non-trivial");
+        assert_eq!(&first_value[..4], b"\x89PNG", "should be valid PNG data");
+    }
+
+    #[test]
+    fn test_read_binary_vs_string_column_type_distinction() {
+        // Col 0 (bytes) should be Binary, col 1 (path) should be Utf8/String
+        let file = get_libero_fixture();
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        // Col 0: binary
+        let f = get_libero_fixture();
+        let (binary_array, _) = read_page_with_row_count(f, 0, 0, 0).unwrap();
+        assert_eq!(binary_array.data_type(), &arrow_schema::DataType::Binary,
+            "col 0 (bytes) should be Binary");
+
+        // Col 1: string
+        let f = get_libero_fixture();
+        let (string_array, _) = read_page_with_row_count(f, 0, 1, 0).unwrap();
+        assert_eq!(string_array.data_type(), &arrow_schema::DataType::Utf8,
+            "col 1 (path) should be Utf8/String");
+    }
+
+    #[test]
+    fn test_read_binary_column_all_pages_row_count() {
+        // Sum row counts across all pages of the binary column to verify total rows
+        let file = get_libero_fixture();
+        let locs = get_file_page_locations(file).unwrap().unwrap();
+
+        for rg_idx in 0..locs.len() {
+            let num_pages = locs[rg_idx][0].len();
+            assert!(num_pages >= 1, "should have at least 1 page");
+
+            let mut total_rows = 0;
+            for page_idx in 0..num_pages {
+                let f = get_libero_fixture();
+                let (array, row_count) = read_page_with_row_count(f, rg_idx, 0, page_idx).unwrap();
+                assert_eq!(array.len(), row_count);
+                assert_eq!(array.data_type(), &arrow_schema::DataType::Binary);
+                total_rows += row_count;
+            }
+            assert_eq!(total_rows, 50,
+                "row group {} should have 50 rows (frames per episode)", rg_idx);
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_with_binary() {
+        // Read binary column (col 0) alongside INT64 columns (cols 4, 5)
+        let file = get_libero_fixture();
+        let results = read_multi_column_aligned(file, 0, &[0, 4, 5], 0).unwrap();
+
+        assert_eq!(results.len(), 3);
+
+        // All columns must have the same row count
+        let row_count = results[0].1;
+        assert!(row_count > 0);
+        for (i, (array, rc)) in results.iter().enumerate() {
+            assert_eq!(*rc, row_count, "column {} row count mismatch", i);
+            assert_eq!(array.len(), row_count);
+        }
+
+        // Verify types
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Binary,
+            "col 0 should be Binary");
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Int64,
+            "col 4 (frame_index) should be Int64");
+        assert_eq!(results[2].0.data_type(), &arrow_schema::DataType::Int64,
+            "col 5 (episode_index) should be Int64");
+
+        // Verify binary data contains valid PNGs
+        let bin_array = results[0].0.as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+        for i in 0..bin_array.len() {
+            let value = bin_array.value(i);
+            assert_eq!(&value[..4], b"\x89PNG", "row {} should be valid PNG", i);
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_binary_and_string() {
+        // Read binary col (0) and string col (1) together — both BYTE_ARRAY but different logical types
+        let file = get_libero_fixture();
+        let results = read_multi_column_aligned(file, 0, &[0, 1], 0).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, results[1].1, "row counts must match");
+
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Binary);
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Utf8);
+
+        // Verify string values are file paths
+        let str_array = results[1].0.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert!(str_array.value(0).starts_with("frame_"),
+            "path should start with 'frame_', got '{}'", str_array.value(0));
     }
 }
