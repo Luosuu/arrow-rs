@@ -106,6 +106,7 @@ pub mod reader;
 pub mod serialized_reader;
 pub mod statistics;
 pub mod writer;
+/// Direct page access for Parquet files, bypassing standard row-group readers.
 pub mod direct_page;
 
 /// The length of the parquet footer in bytes

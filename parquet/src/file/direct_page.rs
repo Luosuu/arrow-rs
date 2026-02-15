@@ -2,19 +2,19 @@ use arrow_array::types::Utf8Type;
 use arrow_array::{Array, GenericByteArray, PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 use rand::seq::SliceRandom;
-use rand::{thread_rng, Rng};
+use rand::rng;
 use std::sync::Arc;
-use std::{fs::File, io::Read};
+use std::fs::File;
 
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
 use crate::arrow::parquet_to_arrow_schema;
 use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
-use crate::column::page::{Page, PageReader};
+use crate::column::page::Page;
 use crate::column::reader::{ColumnReader, get_column_reader, get_typed_column_reader};
 use crate::column::reader::decoder::{ColumnValueDecoder, ColumnValueDecoderImpl};
-use crate::compression::{create_codec, Codec};
+use crate::compression::create_codec;
 use crate::basic::Type as PhysicalType;
-use crate::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
+use crate::data_type::{ByteArrayType, Int32Type, Int64Type};
 use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
 use crate::file::metadata::thrift::PageHeader;
@@ -26,6 +26,16 @@ use crate::file::serialized_reader::decode_page;
 use crate::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::util::test_common::page_util::InMemoryPageReader;
 
+/// Returns page locations for every column in every row group of a Parquet file.
+///
+/// The result is shaped as `[row_group][column][page]`, where each `PageLocation`
+/// contains the byte offset, compressed page size, and first row index of the page.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+///
+/// # Returns
+/// `Some(locations)` if offset indexes are present, nested as row_group × column × page.
 pub fn get_file_page_locations(file: File) -> Result<Option<Vec<Vec<Vec<PageLocation>>>>> {
     let file_clone = file.try_clone().unwrap();
     let file_reader = SerializedFileReader::new(file_clone).unwrap();
@@ -48,6 +58,14 @@ pub fn get_file_page_locations(file: File) -> Result<Option<Vec<Vec<Vec<PageLoca
     Ok(Some(file_page_locations)) // 3 dim, row_group x column x page
 }
 
+/// Generates randomly shuffled page indices for single-column reading at the file level.
+///
+/// Produces `(row_group_idx, page_idx)` pairs covering every page of the given column,
+/// in a random order. Used for page-level shuffling in single-column datasets.
+///
+/// # Arguments
+/// * `file_page_locations` - Page locations as returned by `get_file_page_locations`.
+/// * `column_idx` - The column index to shuffle pages for.
 pub fn generate_random_page_indices_file_level(
     file_page_locations: Vec<Vec<Vec<PageLocation>>>,
     column_idx: usize,
@@ -62,7 +80,7 @@ pub fn generate_random_page_indices_file_level(
     }
 
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
-    page_random_indices.shuffle(&mut thread_rng());
+    page_random_indices.shuffle(&mut rng());
 
     // binary search into the page_num_offsets to create (row_group_idx, page_idx) pairs
     let mut random_rg_page_indices_pairs = Vec::new();
@@ -76,6 +94,14 @@ pub fn generate_random_page_indices_file_level(
     Ok(random_rg_page_indices_pairs) // 2-dim, (row_group_idx, page_idx)
 }
 
+/// Generates randomly shuffled page indices for single-column reading at the dataset level.
+///
+/// Extends `generate_random_page_indices_file_level` across multiple files, producing
+/// `(file_idx, row_group_idx, page_idx)` triples in random order.
+///
+/// # Arguments
+/// * `dataset_page_locations` - Page locations for all files. Shape: `[file][row_group][column][page]`.
+/// * `column_idx` - The column index to shuffle pages for.
 pub fn generate_random_page_indices_dataset_level(
     dataset_page_locations: Vec<Vec<Vec<Vec<PageLocation>>>>,
     column_idx: usize,
@@ -101,7 +127,7 @@ pub fn generate_random_page_indices_dataset_level(
 
     // Generate random page indices
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
-    page_random_indices.shuffle(&mut thread_rng());
+    page_random_indices.shuffle(&mut rng());
 
     // binary search into two-layer offsets (page_num_offsets_across/within_file) to create random (file, row_group, page) pairs.
     let mut random_page_indices = Vec::new();
@@ -121,12 +147,17 @@ pub fn generate_random_page_indices_dataset_level(
     Ok(random_page_indices)
 }
 
+/// Reads and decodes a single Parquet page at the given byte location.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `page_location` - The byte offset, compressed size, and first row index of the page.
+/// * `column_meta` - Column chunk metadata (needed for physical type and compression codec).
 pub fn get_page_by_location(
     file: File,
     page_location: PageLocation,
     column_meta: &ColumnChunkMetaData,
 ) -> Result<Option<Page>> {
-    // buffer
     let buffer = file
         .get_bytes(
             page_location.offset as u64,
@@ -139,7 +170,6 @@ pub fn get_page_by_location(
 
     let bytes = buffer.slice(offset..);
 
-    // let column_meta = row_group_reader.metadata().column(column_idx);
     let physical_type = column_meta.column_type();
     let props = Arc::new(ReaderProperties::builder().build());
     let decompressor = &mut create_codec(column_meta.compression(), props.codec_options())?;
@@ -149,6 +179,16 @@ pub fn get_page_by_location(
     Ok(Some(page))
 }
 
+/// Reads and decodes a single Parquet page by its row group, column, and page index.
+///
+/// Looks up the page location from the file's offset index, then delegates to
+/// `get_page_by_location` for the actual read and decode.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - Zero-based row group index.
+/// * `column_idx` - Zero-based column index.
+/// * `page_idx` - Zero-based page index within the column chunk.
 pub fn get_page_by_idx(
     file: File,
     row_group_idx: usize,
@@ -158,37 +198,21 @@ pub fn get_page_by_idx(
     let file_clone = file.try_clone().unwrap();
     let file_reader = SerializedFileReader::new(file_clone).unwrap();
     let row_group_reader = file_reader.get_row_group(row_group_idx)?;
-    // the iterative page reader for one column
-    // let _page_reader = row_group_reader.get_column_page_reader(column_idx).unwrap();
 
-    // Get the page location for the specified column and page index
     #[allow(deprecated)]
     let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?;
-    let page_locations = offset_indexes
-        .as_ref()
-        .unwrap();
+    let page_locations = offset_indexes.as_ref().unwrap();
     let page_location = &page_locations[column_idx].page_locations()[page_idx];
-    // buffer
-    let buffer = file
-        .get_bytes(
-            page_location.offset as u64,
-            page_location.compressed_page_size as usize,
-        )
-        .unwrap();
-    let mut prot = ThriftSliceInputProtocol::new(buffer.as_ref());
-    PageHeader::read_thrift(&mut prot).unwrap();
-    let offset = buffer.len() - prot.as_slice().len();
-
-    buffer.slice(offset..);
 
     let column_meta = row_group_reader.metadata().column(column_idx);
-    let page = get_page_by_location(file, page_location.clone(), column_meta);
-
-    page
+    get_page_by_location(file, page_location.clone(), column_meta)
 }
 
-/// a failed attempt to read page into batches through ByteArray decoder.
-/// maybe record_reader instead of low-level ByteArray decoder should be used here.
+/// Reads a page into a RecordBatch using the ByteArray decoder.
+///
+/// **Known issue:** Creates a RecordBatch with the full file schema but only one
+/// column of data, causing a schema mismatch. Prefer `read_page_with_row_count`
+/// for production use.
 pub fn read_page_into_batch(
     file: File,
     row_group_idx: usize,
@@ -253,21 +277,7 @@ pub fn read_page_into_batch(
             return Err(e);
         }
     }
-    // Read the values into an OffsetBuffer
-    // let mut buffer = parquet::arrow::record_reader::buffer::OffsetBuffer::<i32>::default();
     let mut buffer = crate::arrow::buffer::offset_buffer::OffsetBuffer::default();
-
-    println!(
-        "Page metadata: num_values={}, encoding={:?}",
-        page.num_values(),
-        page.encoding()
-    );
-    println!(
-        "Decoder metadata: num_levels={}, data_len={}",
-        num_levels,
-        bytes.len()
-    );
-    println!("Page buffer: {:?}", page.buffer());
 
     let _num_values = match decoder.read(&mut buffer, page.num_values() as usize) {
         Ok(num) => num,
@@ -287,15 +297,9 @@ pub fn read_page_into_batch(
         }
     };
 
-    // Convert the Vec<u8> to an Arrow Array
     let array = buffer.into_array(None, DataType::Binary);
-    // let array = arrow::array::BinaryArray::from_vec(buffer);
 
-    // Create a SchemaDescriptor from the Parquet schema
     let parquet_schema = parquet_metadata.file_metadata().schema_descr();
-
-    // Create a RecordBatch from the array
-    // Create a RecordBatch from the array
     let schema = parquet_to_arrow_schema(
         &parquet_schema,
         parquet_metadata.file_metadata().key_value_metadata(),
@@ -306,7 +310,16 @@ pub fn read_page_into_batch(
     Ok(Some(batch))
 }
 
-/// an attempt to use record_read instead of ByteArray decoder to read records from pages
+/// Reads an INT32 page and returns its data as an `Int32Array`.
+///
+/// Uses a `RecordReader` to decode the page. For a type-agnostic alternative,
+/// see `read_page_with_row_count`.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - Zero-based row group index.
+/// * `column_idx` - Zero-based column index (must be INT32).
+/// * `page_idx` - Zero-based page index within the column chunk.
 pub fn read_record_from_page(
     file: File,
     row_group_idx: usize,
@@ -327,55 +340,31 @@ pub fn read_record_from_page(
         .unwrap()
         .unwrap();
 
-    // println!("DEBUG INFO: num  of values in the page: {:?}", page.num_values());
-    // Create a RecordReader for the column
     let mut record_reader: GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> =
         RecordReader::<Int32Type>::new(column_desc.clone());
 
-    // Create an InMemoryPageReader with the page data
-    // println!("DEBUG INFO: page.buffer(): {:?}", page.buffer());
     let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
-
-    // Set the page reader for the record reader
     record_reader.set_page_reader(page_reader).unwrap();
 
-    // Read all the records from the page
     let num_records_to_read = usize::try_from(page.num_values()).unwrap();
-    let num_read = record_reader.read_records(num_records_to_read).unwrap();
-
-    // if num_read != num_records_to_read {
-    //     log::warn!(
-    //         "Expected to read {} records, but only read {}",
-    //         num_records_to_read,
-    //         num_read
-    //     );
-    // } else {
-    //     // println!("DEBUG INFO: num of records to read: {:?}", num_records_to_read);
-    // }
+    let _num_read = record_reader.read_records(num_records_to_read).unwrap();
 
     let record_data = record_reader.consume_record_data();
-
-    // println!("DEBUG INFO: record_data: Vec<i32>: {:?}", record_data); // Vec data here, next is to transform into Arrow object
-    // Create an Arrow array from the values
     let array = arrow_array::Int32Array::from(record_data);
-
-    // step to create RecordBatch
-    // Create a SchemaDescriptor from the Parquet schema
-    // let parquet_schema = parquet_metadata.file_metadata().schema_descr();
-    //
-    // // Create a RecordBatch from the array
-    // let schema = parquet_to_arrow_schema(
-    //     &parquet_schema,
-    //     parquet_metadata.file_metadata().key_value_metadata(),
-    // ).unwrap();
-    // let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])
-    //     .unwrap();
-    // However, the column number in original parquet schema does not match the data we read
-    // But Arrow array is enough.
 
     Ok(Some(array))
 }
 
+/// Reads a BYTE_ARRAY (String) page and returns its data as a `StringArray`.
+///
+/// Uses a typed column reader to decode byte array values and interpret them
+/// as UTF-8 strings. For a type-agnostic alternative, see `read_page_with_row_count`.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - Zero-based row group index.
+/// * `column_idx` - Zero-based column index (must be BYTE_ARRAY).
+/// * `page_idx` - Zero-based page index within the column chunk.
 pub fn read_record_from_page_string(
     file: File,
     row_group_idx: usize,
@@ -391,19 +380,11 @@ pub fn read_record_from_page_string(
         .schema_descr_ptr()
         .column(column_idx);
 
-    /// potentially we can infer the data type (INT32/BYTE_ARRAY) from column_desc
-    /// let col_physical_type = column_desc.physical_type();
-    // Get the page for the desired column chunk and page index
     let page: Page = get_page_by_idx(file, row_group_idx, column_idx, page_idx)
         .unwrap()
         .unwrap();
 
-    // let mut record_reader = RecordReader::<ByteArrayType>::new(column_desc.clone());
-    
     let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
-    
-    // record_reader.set_page_reader(page_reader).expect("TODO: panic message");
-    
     let column_reader: ColumnReader = get_column_reader(column_desc, page_reader);
     let mut typed_column_reader = get_typed_column_reader::<ByteArrayType>(column_reader);
 
@@ -413,7 +394,7 @@ pub fn read_record_from_page_string(
     let mut def_levels = Vec::new();
     let mut rep_levels = Vec::new();
 
-    let (_, values_read, levels_read) = typed_column_reader
+    let (_, _values_read, _levels_read) = typed_column_reader
         .read_records(
             num_records_to_read,
             Some(&mut def_levels),
@@ -672,7 +653,7 @@ pub fn generate_shuffled_multi_column_indices_file_level(
     }
 
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
-    page_random_indices.shuffle(&mut thread_rng());
+    page_random_indices.shuffle(&mut rng());
 
     let mut random_rg_page_indices_pairs = Vec::new();
     for &page_random_index in &page_random_indices {
@@ -724,7 +705,7 @@ pub fn generate_shuffled_multi_column_indices_dataset_level(
     }
 
     let mut page_random_indices: Vec<usize> = (0..total_page_num).collect();
-    page_random_indices.shuffle(&mut thread_rng());
+    page_random_indices.shuffle(&mut rng());
 
     let mut random_page_indices = Vec::new();
     for &page_random_index in &page_random_indices {
@@ -753,7 +734,7 @@ fn read_rows_from_column(
     row_start: usize,
     row_end: usize,
     num_rows_in_rg: usize,
-    parquet_metadata: &crate::file::metadata::ParquetMetaData,
+    _parquet_metadata: &crate::file::metadata::ParquetMetaData,
 ) -> Result<Arc<dyn Array>> {
     // Find all pages that overlap with [row_start, row_end)
     let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
@@ -934,7 +915,6 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let _buf = page.buffer(); // TODO: transform page buffer (data) to arrow/pyarrow object
         assert_eq!(page.page_type(), PageType::DATA_PAGE);
     }
 
