@@ -530,6 +530,180 @@ pub fn read_page_with_row_count(
     }
 }
 
+/// Reads aligned data from multiple columns for a given row group, returning arrays
+/// that correspond to the same logical rows.
+///
+/// Given a row group and a page index (interpreted as the page index of the first
+/// column in `column_indices`), this function determines the row range covered by that
+/// page and then reads the corresponding rows from all requested columns.
+///
+/// Different columns may have different page boundaries. This function uses
+/// `PageLocation.first_row_index` from the offset index to align reads across columns,
+/// ensuring that the returned arrays all cover the same row range.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `row_group_idx` - The zero-based index of the row group to read from.
+/// * `column_indices` - A list of zero-based column indices to read.
+/// * `page_idx` - The page index within the first column of `column_indices`. This
+///   determines the row range to read from all columns.
+///
+/// # Returns
+/// A `Vec<(Arc<dyn Array>, usize)>` with one entry per requested column. Each entry
+/// contains the decoded Arrow array and the number of rows, which will be identical
+/// across all columns.
+///
+/// # Errors
+/// Returns `ParquetError` if page locations are unavailable, a column index is out of
+/// bounds, or any page read/decode fails.
+pub fn read_multi_column_aligned(
+    file: File,
+    row_group_idx: usize,
+    column_indices: &[usize],
+    page_idx: usize,
+) -> Result<Vec<(Arc<dyn Array>, usize)>> {
+    if column_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    // Get page locations for all columns in this row group
+    let row_group_reader = file_reader.get_row_group(row_group_idx)?;
+    #[allow(deprecated)]
+    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+        .ok_or_else(|| {
+            ParquetError::General(
+                "Offset index not available; file must be written with write_page_index=True"
+                    .to_string(),
+            )
+        })?;
+
+    let all_page_locations: Vec<Vec<PageLocation>> = offset_indexes
+        .into_iter()
+        .map(|idx| idx.page_locations().clone())
+        .collect();
+
+    // Determine the row range from the reference column (first in column_indices)
+    let ref_col = column_indices[0];
+    let ref_pages = &all_page_locations[ref_col];
+    if page_idx >= ref_pages.len() {
+        return Err(ParquetError::General(format!(
+            "page_idx {} out of range for column {} which has {} pages",
+            page_idx,
+            ref_col,
+            ref_pages.len()
+        )));
+    }
+
+    let row_start = ref_pages[page_idx].first_row_index as usize;
+    let row_end = if page_idx + 1 < ref_pages.len() {
+        ref_pages[page_idx + 1].first_row_index as usize
+    } else {
+        num_rows_in_rg
+    };
+    let target_row_count = row_end - row_start;
+
+    // For each requested column, find pages that overlap [row_start, row_end) and
+    // read + slice them to produce exactly `target_row_count` rows.
+    let mut results = Vec::with_capacity(column_indices.len());
+
+    for &col_idx in column_indices {
+        let col_pages = &all_page_locations[col_idx];
+        let array = read_rows_from_column(
+            &file,
+            row_group_idx,
+            col_idx,
+            col_pages,
+            row_start,
+            row_end,
+            num_rows_in_rg,
+            parquet_metadata,
+        )?;
+        assert_eq!(
+            array.len(),
+            target_row_count,
+            "column {} produced {} rows but expected {}",
+            col_idx,
+            array.len(),
+            target_row_count
+        );
+        results.push((array, target_row_count));
+    }
+
+    Ok(results)
+}
+
+/// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
+/// pages and slicing appropriately.
+fn read_rows_from_column(
+    file: &File,
+    row_group_idx: usize,
+    col_idx: usize,
+    col_pages: &[PageLocation],
+    row_start: usize,
+    row_end: usize,
+    num_rows_in_rg: usize,
+    parquet_metadata: &crate::file::metadata::ParquetMetaData,
+) -> Result<Arc<dyn Array>> {
+    // Find all pages that overlap with [row_start, row_end)
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (p_idx, page_loc) in col_pages.iter().enumerate() {
+        let p_row_start = page_loc.first_row_index as usize;
+        let p_row_end = if p_idx + 1 < col_pages.len() {
+            col_pages[p_idx + 1].first_row_index as usize
+        } else {
+            num_rows_in_rg
+        };
+
+        // Skip pages entirely before or after our target range
+        if p_row_end <= row_start || p_row_start >= row_end {
+            continue;
+        }
+
+        // Read the full page
+        let f = file.try_clone().unwrap();
+        let (page_array, _) = read_page_with_row_count(f, row_group_idx, col_idx, p_idx)?;
+
+        // Compute the slice within this page that overlaps with [row_start, row_end)
+        let slice_start = if row_start > p_row_start {
+            row_start - p_row_start
+        } else {
+            0
+        };
+        let slice_end = if row_end < p_row_end {
+            row_end - p_row_start
+        } else {
+            page_array.len()
+        };
+
+        let sliced = page_array.slice(slice_start, slice_end - slice_start);
+        arrays.push(sliced);
+    }
+
+    // Concatenate all slices
+    if arrays.is_empty() {
+        return Err(ParquetError::General(format!(
+            "No pages found for column {} covering rows [{}, {})",
+            col_idx, row_start, row_end
+        )));
+    }
+
+    if arrays.len() == 1 {
+        Ok(arrays.into_iter().next().unwrap())
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        let concatenated = arrow_select::concat::concat(&refs).map_err(|e| {
+            ParquetError::General(format!("Failed to concatenate arrays: {}", e))
+        })?;
+        Ok(concatenated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -537,7 +711,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, get_file_page_locations, get_page_by_idx, read_multi_column_aligned, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -796,6 +970,115 @@ mod tests {
                     rg_idx, col_idx
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_basic() {
+        // multi_column.parquet: col 0 = INT32, col 1 = String, col 2 = INT64
+        // Read all 3 columns aligned from row group 0, page 0
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[0, 1, 2], 0).unwrap();
+
+        assert_eq!(results.len(), 3, "should return 3 columns");
+
+        // All columns must have the same row count
+        let row_count = results[0].1;
+        assert!(row_count > 0, "row_count should be positive");
+        for (i, (array, rc)) in results.iter().enumerate() {
+            assert_eq!(*rc, row_count, "column {} row count mismatch", i);
+            assert_eq!(array.len(), row_count, "column {} array length mismatch", i);
+        }
+
+        // Verify data types
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Int32);
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Utf8);
+        assert_eq!(results[2].0.data_type(), &arrow_schema::DataType::Int64);
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_all_pages_cover_full_row_group() {
+        // Iterate through all pages (of reference column 0) and verify that
+        // the total rows across all pages equals the row group row count (2000)
+        let file = get_fixture_file("multi_column.parquet");
+        let page_locations = get_file_page_locations(file.try_clone().unwrap())
+            .unwrap()
+            .unwrap();
+
+        let num_pages_col0 = page_locations[0][0].len();
+        assert!(num_pages_col0 > 1, "should have multiple pages");
+
+        let mut total_rows = 0;
+        for page_idx in 0..num_pages_col0 {
+            let f = get_fixture_file("multi_column.parquet");
+            let results = read_multi_column_aligned(f, 0, &[0, 1, 2], page_idx).unwrap();
+            let row_count = results[0].1;
+            // All columns should match
+            for (_, rc) in &results {
+                assert_eq!(*rc, row_count);
+            }
+            total_rows += row_count;
+        }
+        assert_eq!(total_rows, 2000, "all pages should cover all 2000 rows");
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_two_columns() {
+        // Read only 2 of 3 columns (INT32 and INT64, skipping String)
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[0, 2], 0).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1, results[1].1, "row counts must match");
+        assert_eq!(results[0].0.data_type(), &arrow_schema::DataType::Int32);
+        assert_eq!(results[1].0.data_type(), &arrow_schema::DataType::Int64);
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_row_group_1() {
+        // Verify alignment works for row group 1 as well
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 1, &[0, 1, 2], 0).unwrap();
+
+        assert_eq!(results.len(), 3);
+        let row_count = results[0].1;
+        assert!(row_count > 0);
+        for (array, rc) in &results {
+            assert_eq!(*rc, row_count);
+            assert_eq!(array.len(), row_count);
+        }
+    }
+
+    #[test]
+    fn test_read_multi_column_aligned_data_correctness() {
+        // Verify actual data values are correct and aligned
+        // The fixture generates: col0 = row_idx (INT32), col2 = row_idx * 100 (INT64)
+        let file = get_fixture_file("multi_column.parquet");
+        let results = read_multi_column_aligned(file, 0, &[0, 2], 0).unwrap();
+
+        let int32_array = results[0]
+            .0
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let int64_array = results[1]
+            .0
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+
+        // For each row, int64 value should be int32 value * 100
+        for i in 0..int32_array.len() {
+            let v32 = int32_array.value(i);
+            let v64 = int64_array.value(i);
+            assert_eq!(
+                v64,
+                v32 as i64 * 100,
+                "row {}: INT64 ({}) should be INT32 ({}) * 100",
+                i,
+                v64,
+                v32
+            );
         }
     }
 }
