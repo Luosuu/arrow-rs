@@ -127,6 +127,8 @@ zstd = ["dep:zstd"]
 crc = ["dep:crc32fast"]
 # Enable SIMD UTF-8 validation
 simdutf8 = ["dep:simdutf8"]
+# Enable I/O amplification instrumentation (zero-cost when disabled)
+instrument = []
 # Enable Parquet modular encryption support
 encryption = ["dep:ring"]
 # Explicitely enabling rust_backend and zlib-rs features for flate2

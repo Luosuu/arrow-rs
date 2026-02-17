@@ -6,6 +6,42 @@ use rand::rng;
 use std::sync::Arc;
 use std::fs::File;
 
+// I/O amplification instrumentation — zero-cost when the `instrument` feature is disabled.
+#[cfg(feature = "instrument")]
+use std::cell::Cell;
+
+#[cfg(feature = "instrument")]
+thread_local! {
+    /// Total pages read from disk.
+    static IO_PAGES_READ: Cell<u64> = const { Cell::new(0) };
+    /// Total rows contained in those pages (before slicing).
+    static IO_ROWS_IN_PAGES: Cell<u64> = const { Cell::new(0) };
+    /// Rows actually needed (the requested slice).
+    static IO_ROWS_NEEDED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Returns accumulated I/O amplification stats and resets the counters.
+///
+/// Returns `(pages_read, rows_in_pages, rows_needed)`.
+/// - `pages_read`: number of full Parquet pages decoded from disk.
+/// - `rows_in_pages`: total number of rows in those pages (before slicing).
+/// - `rows_needed`: the number of rows that were actually requested (the slice).
+///
+/// Only available when compiled with the `instrument` Cargo feature.
+/// When the feature is disabled this function still exists but always returns `(0, 0, 0)`.
+#[cfg(feature = "instrument")]
+pub fn get_io_stats() -> (u64, u64, u64) {
+    let pages = IO_PAGES_READ.with(|c| c.replace(0));
+    let rows_in = IO_ROWS_IN_PAGES.with(|c| c.replace(0));
+    let rows_needed = IO_ROWS_NEEDED.with(|c| c.replace(0));
+    (pages, rows_in, rows_needed)
+}
+
+#[cfg(not(feature = "instrument"))]
+pub fn get_io_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
 use crate::arrow::array_reader::byte_array::ByteArrayColumnValueDecoder;
 use crate::arrow::parquet_to_arrow_schema;
 use crate::arrow::record_reader::{GenericRecordReader, RecordReader};
@@ -1076,6 +1112,17 @@ fn read_rows_from_column(
         let f = file.try_clone().unwrap();
         let (page_array, _) = read_page_with_row_count(f, row_group_idx, col_idx, p_idx)?;
 
+        let page_rows = p_row_end - p_row_start;
+
+        #[cfg(feature = "instrument")]
+        {
+            IO_PAGES_READ.with(|c| c.set(c.get() + 1));
+            IO_ROWS_IN_PAGES.with(|c| c.set(c.get() + page_rows as u64));
+        }
+        // Suppress unused variable warning when instrument is disabled
+        #[cfg(not(feature = "instrument"))]
+        let _ = page_rows;
+
         // Compute the slice within this page that overlaps with [row_start, row_end)
         let slice_start = row_start.saturating_sub(p_row_start);
         let slice_end = if row_end < p_row_end {
@@ -1086,6 +1133,12 @@ fn read_rows_from_column(
 
         let sliced = page_array.slice(slice_start, slice_end - slice_start);
         arrays.push(sliced);
+    }
+
+    #[cfg(feature = "instrument")]
+    {
+        let rows_needed = (row_end - row_start) as u64;
+        IO_ROWS_NEEDED.with(|c| c.set(c.get() + rows_needed));
     }
 
     // Concatenate all slices
@@ -1116,7 +1169,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -2718,5 +2771,82 @@ mod tests {
             assert_eq!(*row_count, 2000);
             assert_eq!(array.len(), 2000);
         }
+    }
+
+    #[test]
+    fn test_get_io_stats_returns_and_resets() {
+        // get_io_stats should return (0, 0, 0) initially (or after a reset)
+        let (pages, rows_in, rows_needed) = get_io_stats();
+        // Without the instrument feature these are always 0.
+        // With the instrument feature, they start at 0 and accumulate.
+        // Either way, after calling get_io_stats the counters are 0.
+        assert_eq!(pages, 0);
+        assert_eq!(rows_in, 0);
+        assert_eq!(rows_needed, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "instrument")]
+    fn test_instrumentation_counts_pages_for_row_range() {
+        // Read rows 0-1000 from column 0 (INT32) in multi_column.parquet
+        // With 2000 rows and data_page_size=256 (64 INT32 values per page),
+        // reading half the row group should hit many pages.
+        let file = get_fixture_file("multi_column.parquet");
+
+        // Reset counters
+        let _ = get_io_stats();
+
+        // Read a large row range
+        let (array, _) = read_row_range(
+            file.try_clone().unwrap(),
+            0,    // rg 0
+            0,    // col 0 (INT32)
+            0,    // start
+            1000, // end
+        )
+        .unwrap();
+        assert_eq!(array.len(), 1000);
+
+        let (pages_read, rows_in_pages, rows_needed) = get_io_stats();
+
+        // We requested 1000 rows
+        assert_eq!(rows_needed, 1000);
+        // Must have read at least 1 page
+        assert!(pages_read >= 1, "Expected >= 1 pages read, got {}", pages_read);
+        // rows_in_pages >= rows_needed (pages contain the requested rows)
+        assert!(
+            rows_in_pages >= rows_needed,
+            "Expected rows_in_pages ({}) >= rows_needed ({})",
+            rows_in_pages,
+            rows_needed
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "instrument")]
+    fn test_instrumentation_accumulates_across_calls() {
+        let file = get_fixture_file("multi_column.parquet");
+
+        // Reset counters
+        let _ = get_io_stats();
+
+        // First read: rows 0-10
+        let _ = read_row_range(file.try_clone().unwrap(), 0, 0, 0, 10).unwrap();
+
+        // Second read: rows 100-110
+        let _ = read_row_range(file.try_clone().unwrap(), 0, 0, 100, 110).unwrap();
+
+        let (pages_read, _rows_in_pages, rows_needed) = get_io_stats();
+
+        // Two reads of 10 rows each = 20 rows needed total
+        assert_eq!(rows_needed, 20);
+        // At least 2 pages read (one for each call, possibly more)
+        assert!(pages_read >= 2, "Expected >= 2 pages read, got {}", pages_read);
+
+        // After get_io_stats, counters should be reset
+        let (pages2, rows_in2, needed2) = get_io_stats();
+        assert_eq!(pages2, 0);
+        assert_eq!(rows_in2, 0);
+        assert_eq!(needed2, 0);
     }
 }
