@@ -119,6 +119,31 @@ impl ParquetReaderCache {
     }
 }
 
+/// Returns a `SerializedFileReader` for the given path, using the cache if provided
+/// or opening the file fresh.
+///
+/// When `cache` is `Some`, the reader (and its parsed metadata) are cached for reuse
+/// across calls, avoiding expensive repeated metadata parsing. When `cache` is `None`,
+/// a new `SerializedFileReader` is created by opening the file at `path`.
+///
+/// # Arguments
+/// * `path` - The file path to open
+/// * `cache` - Optional cache to store/retrieve readers
+fn get_or_open_reader(
+    path: &Path,
+    cache: Option<&mut ParquetReaderCache>,
+) -> Result<Arc<SerializedFileReader<File>>> {
+    match cache {
+        Some(c) => c.get_reader(path),
+        None => {
+            let f = File::open(path).map_err(|e| {
+                ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+            })?;
+            Ok(Arc::new(SerializedFileReader::new(f)?))
+        }
+    }
+}
+
 /// Returns page locations for every column in every row group of a Parquet file.
 ///
 /// The result is shaped as `[row_group][column][page]`, where each `PageLocation`
@@ -984,6 +1009,43 @@ pub fn read_row_range(
     }
 
     let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    read_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+}
+
+/// Cache-aware variant of [`read_row_range`].
+///
+/// When `cache` is provided, the file reader (and its parsed metadata) are retrieved
+/// from the cache, avoiding repeated file open and metadata parsing.
+pub fn read_row_range_cached(
+    path: &Path,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    cache: &mut ParquetReaderCache,
+) -> Result<(Arc<dyn Array>, usize)> {
+    if start_row >= end_row {
+        return Err(ParquetError::General(format!(
+            "Invalid row range: start_row ({}) must be less than end_row ({})",
+            start_row, end_row
+        )));
+    }
+
+    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let file = File::open(path).map_err(|e| {
+        ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+    })?;
+    read_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+}
+
+fn read_row_range_with_reader(
+    file: &File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+) -> Result<(Arc<dyn Array>, usize)> {
     let parquet_metadata = file_reader.metadata();
     let row_group_meta = parquet_metadata.row_group(row_group_idx);
     let num_rows_in_rg = row_group_meta.num_rows() as usize;
@@ -997,7 +1059,7 @@ pub fn read_row_range(
 
     let row_group_reader = file_reader.get_row_group(row_group_idx)?;
     #[allow(deprecated)]
-    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+    let offset_indexes = read_offset_indexes(file, row_group_reader.metadata().columns())?
         .ok_or_else(|| {
             ParquetError::General(
                 "Offset index not available; file must be written with write_page_index=True"
@@ -1008,7 +1070,7 @@ pub fn read_row_range(
     let col_pages: Vec<PageLocation> = offset_indexes[column_idx].page_locations().clone();
 
     let array = read_rows_from_column(
-        &file,
+        file,
         row_group_idx,
         column_idx,
         &col_pages,
@@ -1054,6 +1116,43 @@ pub fn read_list_row_range(
     }
 
     let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    read_list_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+}
+
+/// Cache-aware variant of [`read_list_row_range`].
+///
+/// When `cache` is provided, the file reader (and its parsed metadata) are retrieved
+/// from the cache, avoiding repeated file open and metadata parsing.
+pub fn read_list_row_range_cached(
+    path: &Path,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    cache: &mut ParquetReaderCache,
+) -> Result<(Arc<dyn Array>, usize)> {
+    if start_row >= end_row {
+        return Err(ParquetError::General(format!(
+            "Invalid row range: start_row ({}) must be less than end_row ({})",
+            start_row, end_row
+        )));
+    }
+
+    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let file = File::open(path).map_err(|e| {
+        ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+    })?;
+    read_list_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+}
+
+fn read_list_row_range_with_reader(
+    file: &File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+) -> Result<(Arc<dyn Array>, usize)> {
     let parquet_metadata = file_reader.metadata();
     let row_group_meta = parquet_metadata.row_group(row_group_idx);
     let num_rows_in_rg = row_group_meta.num_rows() as usize;
@@ -1067,7 +1166,7 @@ pub fn read_list_row_range(
 
     let row_group_reader = file_reader.get_row_group(row_group_idx)?;
     #[allow(deprecated)]
-    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+    let offset_indexes = read_offset_indexes(file, row_group_reader.metadata().columns())?
         .ok_or_else(|| {
             ParquetError::General(
                 "Offset index not available; file must be written with write_page_index=True"
@@ -1196,6 +1295,47 @@ pub fn read_multi_column_row_range(
     }
 
     let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    read_multi_column_row_range_with_reader(&file, row_group_idx, column_indices, start_row, end_row, &file_reader)
+}
+
+/// Cache-aware variant of [`read_multi_column_row_range`].
+///
+/// When `cache` is provided, the file reader (and its parsed metadata) are retrieved
+/// from the cache, avoiding repeated file open and metadata parsing.
+pub fn read_multi_column_row_range_cached(
+    path: &Path,
+    row_group_idx: usize,
+    column_indices: &[usize],
+    start_row: usize,
+    end_row: usize,
+    cache: &mut ParquetReaderCache,
+) -> Result<Vec<(Arc<dyn Array>, usize)>> {
+    if column_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if start_row >= end_row {
+        return Err(ParquetError::General(format!(
+            "Invalid row range: start_row ({}) must be less than end_row ({})",
+            start_row, end_row
+        )));
+    }
+
+    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let file = File::open(path).map_err(|e| {
+        ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+    })?;
+    read_multi_column_row_range_with_reader(&file, row_group_idx, column_indices, start_row, end_row, &file_reader)
+}
+
+fn read_multi_column_row_range_with_reader(
+    file: &File,
+    row_group_idx: usize,
+    column_indices: &[usize],
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+) -> Result<Vec<(Arc<dyn Array>, usize)>> {
     let parquet_metadata = file_reader.metadata();
     let row_group_meta = parquet_metadata.row_group(row_group_idx);
     let num_rows_in_rg = row_group_meta.num_rows() as usize;
@@ -1209,7 +1349,7 @@ pub fn read_multi_column_row_range(
 
     let row_group_reader = file_reader.get_row_group(row_group_idx)?;
     #[allow(deprecated)]
-    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+    let offset_indexes = read_offset_indexes(file, row_group_reader.metadata().columns())?
         .ok_or_else(|| {
             ParquetError::General(
                 "Offset index not available; file must be written with write_page_index=True"
@@ -1228,7 +1368,7 @@ pub fn read_multi_column_row_range(
     for &col_idx in column_indices {
         let col_pages = &all_page_locations[col_idx];
         let array = read_rows_from_column(
-            &file,
+            file,
             row_group_idx,
             col_idx,
             col_pages,
@@ -1459,7 +1599,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_list_row_range, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row, ParquetReaderCache};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_or_open_reader, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_list_row_range, read_list_row_range_cached, read_multi_column_aligned, read_multi_column_row_range, read_multi_column_row_range_cached, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_row_range_cached, read_single_row, ParquetReaderCache};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -3505,5 +3645,116 @@ mod tests {
         let result = cache.get_reader(&path);
         assert!(result.is_err());
         assert_eq!(cache.len(), 0); // should not cache failed opens
+    }
+
+    // --- Cache-aware read function tests ---
+
+    #[test]
+    fn test_get_or_open_reader_without_cache() {
+        let path = get_fixture_path("multi_column.parquet");
+        let reader = get_or_open_reader(&path, None).unwrap();
+        let metadata = reader.metadata();
+        assert_eq!(metadata.num_row_groups(), 2);
+    }
+
+    #[test]
+    fn test_get_or_open_reader_with_cache() {
+        let path = get_fixture_path("multi_column.parquet");
+        let mut cache = ParquetReaderCache::new();
+        let reader1 = get_or_open_reader(&path, Some(&mut cache)).unwrap();
+        let reader2 = get_or_open_reader(&path, Some(&mut cache)).unwrap();
+        assert!(Arc::ptr_eq(&reader1, &reader2));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_read_row_range_cached_matches_uncached() {
+        let path = get_fixture_path("multi_column.parquet");
+        let mut cache = ParquetReaderCache::new();
+
+        // Read without cache
+        let file = get_fixture_file("multi_column.parquet");
+        let (array_uncached, count_uncached) = read_row_range(file, 0, 0, 10, 20).unwrap();
+
+        // Read with cache
+        let (array_cached, count_cached) = read_row_range_cached(&path, 0, 0, 10, 20, &mut cache).unwrap();
+
+        assert_eq!(count_uncached, count_cached);
+        assert_eq!(array_uncached.len(), array_cached.len());
+
+        // Verify data matches
+        let uncached_vals = array_uncached.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let cached_vals = array_cached.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        for i in 0..uncached_vals.len() {
+            assert_eq!(uncached_vals.value(i), cached_vals.value(i));
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_cached_reuses_reader() {
+        let path = get_fixture_path("multi_column.parquet");
+        let mut cache = ParquetReaderCache::new();
+
+        // First call opens and caches
+        let _ = read_row_range_cached(&path, 0, 0, 0, 10, &mut cache).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Second call reuses cache
+        let _ = read_row_range_cached(&path, 0, 0, 10, 20, &mut cache).unwrap();
+        assert_eq!(cache.len(), 1); // still 1, not 2
+    }
+
+    #[test]
+    fn test_read_list_row_range_cached_matches_uncached() {
+        let path = get_fixture_path("libero_fixture.parquet");
+        let mut cache = ParquetReaderCache::new();
+
+        // state column is col 2 (list<float> element)
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array_uncached, count_uncached) = read_list_row_range(file, 0, 2, 0, 5).unwrap();
+
+        let (array_cached, count_cached) = read_list_row_range_cached(&path, 0, 2, 0, 5, &mut cache).unwrap();
+
+        assert_eq!(count_uncached, count_cached);
+        assert_eq!(array_uncached.len(), array_cached.len());
+    }
+
+    #[test]
+    fn test_read_multi_column_row_range_cached_matches_uncached() {
+        let path = get_fixture_path("multi_column.parquet");
+        let mut cache = ParquetReaderCache::new();
+
+        let file = get_fixture_file("multi_column.parquet");
+        let results_uncached = read_multi_column_row_range(file, 0, &[0, 2], 5, 15).unwrap();
+        let results_cached = read_multi_column_row_range_cached(&path, 0, &[0, 2], 5, 15, &mut cache).unwrap();
+
+        assert_eq!(results_uncached.len(), results_cached.len());
+        for (i, ((arr_u, cnt_u), (arr_c, cnt_c))) in results_uncached.iter().zip(results_cached.iter()).enumerate() {
+            assert_eq!(cnt_u, cnt_c, "row count mismatch at column {}", i);
+            assert_eq!(arr_u.len(), arr_c.len(), "array length mismatch at column {}", i);
+        }
+    }
+
+    #[test]
+    fn test_read_row_range_cached_invalid_range() {
+        let path = get_fixture_path("multi_column.parquet");
+        let mut cache = ParquetReaderCache::new();
+        let result = read_row_range_cached(&path, 0, 0, 20, 10, &mut cache);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cached_reads_across_multiple_files() {
+        let path1 = get_fixture_path("multi_column.parquet");
+        let path2 = get_fixture_path("single_int32.parquet");
+        let mut cache = ParquetReaderCache::new();
+
+        let _ = read_row_range_cached(&path1, 0, 0, 0, 10, &mut cache).unwrap();
+        let _ = read_row_range_cached(&path2, 0, 0, 0, 10, &mut cache).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Read from first file again — still cached
+        let _ = read_row_range_cached(&path1, 0, 0, 50, 60, &mut cache).unwrap();
+        assert_eq!(cache.len(), 2);
     }
 }
