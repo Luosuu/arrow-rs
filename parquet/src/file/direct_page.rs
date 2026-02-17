@@ -3,6 +3,8 @@ use arrow_array::{Array, GenericByteArray, PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 use rand::seq::SliceRandom;
 use rand::rng;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::fs::File;
 
@@ -61,6 +63,61 @@ use crate::file::reader::*;
 use crate::file::serialized_reader::decode_page;
 use crate::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::util::test_common::page_util::InMemoryPageReader;
+
+/// A cache for `SerializedFileReader` objects, keyed by file path.
+///
+/// Opening a Parquet file and parsing its metadata (row groups, column chunks,
+/// offset indexes) is expensive — especially for files with many row groups.
+/// This cache stores parsed readers so that metadata is parsed only once per file,
+/// and subsequent reads reuse the cached reader.
+///
+/// The cached `SerializedFileReader<File>` holds a `File` handle and parsed
+/// `ParquetMetaData`. Callers that need to do actual I/O should `try_clone()`
+/// the underlying file handle from the cached reader.
+pub struct ParquetReaderCache {
+    cache: HashMap<PathBuf, Arc<SerializedFileReader<File>>>,
+}
+
+impl ParquetReaderCache {
+    /// Creates an empty cache with no cached readers.
+    pub fn new() -> Self {
+        ParquetReaderCache {
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Returns a cached reader for the given path, opening and parsing the file
+    /// if it is not already cached.
+    ///
+    /// The returned `Arc` can be cloned cheaply. The underlying `File` handle
+    /// should be `try_clone()`d for actual I/O operations.
+    pub fn get_reader(&mut self, path: &Path) -> Result<Arc<SerializedFileReader<File>>> {
+        if let Some(reader) = self.cache.get(path) {
+            return Ok(Arc::clone(reader));
+        }
+        let file = File::open(path).map_err(|e| {
+            ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+        })?;
+        let reader = Arc::new(SerializedFileReader::new(file)?);
+        self.cache.insert(path.to_path_buf(), Arc::clone(&reader));
+        Ok(reader)
+    }
+
+    /// Releases all cached readers, freeing file handles and memory.
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Returns the number of files currently cached.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Returns `true` if no files are cached.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+}
 
 /// Returns page locations for every column in every row group of a Parquet file.
 ///
@@ -1402,7 +1459,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_list_row_range, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_list_row_range, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row, ParquetReaderCache};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -3351,5 +3408,102 @@ mod tests {
         assert_eq!(columns.len(), 3);
         // Verify all 3 have same length
         assert!(columns.iter().all(|(_, arr)| arr.len() == 4000));
+    }
+
+    // ── ParquetReaderCache tests ──────────────────────────────────────
+
+    fn get_fixture_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("../../test/fixtures");
+        path.push(name);
+        path
+    }
+
+    #[test]
+    fn test_cache_new_is_empty() {
+        let cache = ParquetReaderCache::new();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_cache_get_reader_caches_and_returns_same() {
+        let mut cache = ParquetReaderCache::new();
+        let path = get_fixture_path("multi_column.parquet");
+
+        let reader1 = cache.get_reader(&path).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        let reader2 = cache.get_reader(&path).unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Same Arc — metadata pointer should be identical
+        assert!(Arc::ptr_eq(&reader1, &reader2));
+    }
+
+    #[test]
+    fn test_cache_metadata_matches_fresh_open() {
+        let mut cache = ParquetReaderCache::new();
+        let path = get_fixture_path("multi_column.parquet");
+
+        let cached_reader = cache.get_reader(&path).unwrap();
+        let cached_meta = cached_reader.metadata();
+
+        // Open the same file fresh for comparison
+        let fresh_reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+        let fresh_meta = fresh_reader.metadata();
+
+        assert_eq!(cached_meta.num_row_groups(), fresh_meta.num_row_groups());
+        for rg in 0..cached_meta.num_row_groups() {
+            assert_eq!(
+                cached_meta.row_group(rg).num_rows(),
+                fresh_meta.row_group(rg).num_rows()
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_clear_drops_all() {
+        let mut cache = ParquetReaderCache::new();
+        let path1 = get_fixture_path("multi_column.parquet");
+        let path2 = get_fixture_path("single_int32.parquet");
+
+        cache.get_reader(&path1).unwrap();
+        cache.get_reader(&path2).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+
+        // After clear, next get_reader re-opens the file
+        let reader = cache.get_reader(&path1).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+    }
+
+    #[test]
+    fn test_cache_multiple_files() {
+        let mut cache = ParquetReaderCache::new();
+
+        let paths = [
+            get_fixture_path("multi_column.parquet"),
+            get_fixture_path("single_int32.parquet"),
+            get_fixture_path("single_string.parquet"),
+        ];
+
+        for p in &paths {
+            cache.get_reader(p).unwrap();
+        }
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn test_cache_nonexistent_file_returns_error() {
+        let mut cache = ParquetReaderCache::new();
+        let path = get_fixture_path("does_not_exist.parquet");
+        let result = cache.get_reader(&path);
+        assert!(result.is_err());
+        assert_eq!(cache.len(), 0); // should not cache failed opens
     }
 }
