@@ -965,6 +965,113 @@ pub fn read_row_range(
     Ok((array, row_count))
 }
 
+/// Reads a range of rows from a LIST<FLOAT32> column in a row group, returning a
+/// `ListArray<Float32>`.
+///
+/// Unlike [`read_row_range`] which returns flat element arrays for list columns,
+/// this function reconstructs proper `ListArray` structures by using rep/def levels.
+/// Each row in the returned array is a list of float values.
+///
+/// # Arguments
+/// * `file` - An open file handle to the Parquet file
+/// * `row_group_idx` - The row group index to read from
+/// * `column_idx` - The column index of the list element column
+/// * `start_row` - The inclusive start row within the row group
+/// * `end_row` - The exclusive end row within the row group
+///
+/// # Returns
+/// A tuple of `(Arc<dyn Array>, usize)` where the array is a `ListArray<Float32>`
+/// and `usize` is the number of rows read (`end_row - start_row`).
+pub fn read_list_row_range(
+    file: File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+) -> Result<(Arc<dyn Array>, usize)> {
+    if start_row >= end_row {
+        return Err(ParquetError::General(format!(
+            "Invalid row range: start_row ({}) must be less than end_row ({})",
+            start_row, end_row
+        )));
+    }
+
+    let file_reader = SerializedFileReader::new(file.try_clone().unwrap())?;
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    if end_row > num_rows_in_rg {
+        return Err(ParquetError::General(format!(
+            "end_row ({}) exceeds row group size ({})",
+            end_row, num_rows_in_rg
+        )));
+    }
+
+    let row_group_reader = file_reader.get_row_group(row_group_idx)?;
+    #[allow(deprecated)]
+    let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+        .ok_or_else(|| {
+            ParquetError::General(
+                "Offset index not available; file must be written with write_page_index=True"
+                    .to_string(),
+            )
+        })?;
+
+    let col_pages: Vec<PageLocation> = offset_indexes[column_idx].page_locations().clone();
+
+    // Find overlapping pages, read each as ListArray, slice, and concat
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (p_idx, page_loc) in col_pages.iter().enumerate() {
+        let p_row_start = page_loc.first_row_index as usize;
+        let p_row_end = if p_idx + 1 < col_pages.len() {
+            col_pages[p_idx + 1].first_row_index as usize
+        } else {
+            num_rows_in_rg
+        };
+
+        // Skip pages entirely before or after our target range
+        if p_row_end <= start_row || p_row_start >= end_row {
+            continue;
+        }
+
+        // Read the full page as a ListArray
+        let f = file.try_clone().unwrap();
+        let (page_array, page_num_rows) = read_list_float_page(f, row_group_idx, column_idx, p_idx)?;
+
+        // Compute the slice within this page that overlaps with [start_row, end_row)
+        let slice_start = start_row.saturating_sub(p_row_start);
+        let slice_end = if end_row < p_row_end {
+            end_row - p_row_start
+        } else {
+            page_num_rows
+        };
+
+        let sliced = page_array.slice(slice_start, slice_end - slice_start);
+        arrays.push(sliced);
+    }
+
+    if arrays.is_empty() {
+        return Err(ParquetError::General(format!(
+            "No pages found for column {} covering rows [{}, {})",
+            column_idx, start_row, end_row
+        )));
+    }
+
+    let result = if arrays.len() == 1 {
+        arrays.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        arrow_select::concat::concat(&refs).map_err(|e| {
+            ParquetError::General(format!("Failed to concatenate list arrays: {}", e))
+        })?
+    };
+
+    let row_count = end_row - start_row;
+    Ok((result, row_count))
+}
+
 /// Reads a single row from a column in a row group, returning a length-1 array.
 ///
 /// This is a convenience wrapper around [`read_row_range`] that reads exactly one row
@@ -1295,7 +1402,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_list_row_range, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -2897,6 +3004,93 @@ mod tests {
             assert_eq!(*row_count, 2000);
             assert_eq!(array.len(), 2000);
         }
+    }
+
+    // ===================== read_list_row_range tests =====================
+
+    #[test]
+    fn test_read_list_row_range_state_first_5() {
+        // Read first 5 rows from state column (col 2, list<float32> with 8 elements)
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_list_row_range(file, 0, 2, 0, 5).unwrap();
+        assert_eq!(row_count, 5);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), 5);
+        // Each row should have 8 elements
+        for i in 0..5 {
+            let inner = list_array.value(i);
+            assert_eq!(inner.len(), 8, "Row {} should have 8 float elements", i);
+        }
+    }
+
+    #[test]
+    fn test_read_list_row_range_action_column() {
+        // Read first 5 rows from action column (col 3, list<float32> with 7 elements)
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_list_row_range(file, 0, 3, 0, 5).unwrap();
+        assert_eq!(row_count, 5);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), 5);
+        for i in 0..5 {
+            let inner = list_array.value(i);
+            assert_eq!(inner.len(), 7, "Row {} should have 7 float elements", i);
+        }
+    }
+
+    #[test]
+    fn test_read_list_row_range_values_correctness() {
+        // Verify actual values match fixture pattern:
+        // state[frame] = [ep*0.1 + frame*0.01 + elem*0.001 for elem in 0..8]
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, _) = read_list_row_range(file, 0, 2, 0, 3).unwrap();
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+
+        // Row 0: episode 0, frame 0
+        let row0 = list_array.value(0);
+        let floats = row0.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+        assert!((floats.value(0) - 0.0).abs() < 1e-4);      // ep=0, frame=0, elem=0
+        assert!((floats.value(1) - 0.001).abs() < 1e-4);     // ep=0, frame=0, elem=1
+    }
+
+    #[test]
+    fn test_read_list_row_range_spanning_pages() {
+        // Read a range that likely spans page boundaries
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_list_row_range(file, 0, 2, 10, 40).unwrap();
+        assert_eq!(row_count, 30);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), 30);
+    }
+
+    #[test]
+    fn test_read_list_row_range_row_group_1() {
+        // Read from row group 1
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_list_row_range(file, 1, 2, 0, 5).unwrap();
+        assert_eq!(row_count, 5);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), 5);
+        // RG 1 is episode 1, frame 0: state[0] = 1*0.1 + 0*0.01 + 0*0.001 = 0.1
+        let row0 = list_array.value(0);
+        let floats = row0.as_any().downcast_ref::<arrow_array::Float32Array>().unwrap();
+        assert!((floats.value(0) - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_read_list_row_range_all_rows() {
+        // Read all 50 rows from row group 0
+        let file = get_fixture_file("libero_fixture.parquet");
+        let (array, row_count) = read_list_row_range(file, 0, 2, 0, 50).unwrap();
+        assert_eq!(row_count, 50);
+        let list_array = array.as_any().downcast_ref::<arrow_array::ListArray>().unwrap();
+        assert_eq!(list_array.len(), 50);
+    }
+
+    #[test]
+    fn test_read_list_row_range_invalid_range() {
+        let file = get_fixture_file("libero_fixture.parquet");
+        let result = read_list_row_range(file, 0, 2, 10, 5);
+        assert!(result.is_err());
     }
 
     #[test]
