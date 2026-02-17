@@ -1079,6 +1079,38 @@ pub fn read_multi_column_row_range(
     Ok(results)
 }
 
+/// Returns schema information for all leaf columns in a Parquet file.
+///
+/// Each entry is `(column_path, physical_type, logical_type)` where:
+/// - `column_path` is dot-separated for nested types (e.g., "observation.images.image.bytes")
+/// - `physical_type` is the Parquet physical type name (e.g., "INT32", "BYTE_ARRAY")
+/// - `logical_type` is the optional Parquet logical type (e.g., "String", "List") or empty string if none
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+pub fn get_parquet_schema(file: File) -> Result<Vec<(String, String, String)>> {
+    let file_reader = SerializedFileReader::new(file)?;
+    let schema_descr = file_reader.metadata().file_metadata().schema_descr();
+    let mut columns = Vec::with_capacity(schema_descr.num_columns());
+    for col in schema_descr.columns() {
+        let column_path = col.path().string();
+        let physical_type = format!("{:?}", col.physical_type());
+        let logical_type = match col.logical_type_ref() {
+            Some(lt) => format!("{:?}", lt),
+            None => {
+                let ct = col.converted_type();
+                if ct != ConvertedType::NONE {
+                    format!("{:?}", ct)
+                } else {
+                    String::new()
+                }
+            }
+        };
+        columns.push((column_path, physical_type, logical_type));
+    }
+    Ok(columns)
+}
+
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
 #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1201,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -2848,5 +2880,72 @@ mod tests {
         assert_eq!(pages2, 0);
         assert_eq!(rows_in2, 0);
         assert_eq!(needed2, 0);
+    }
+
+    // ── get_parquet_schema tests ──
+
+    #[test]
+    fn test_schema_multi_column_fixture() {
+        // multi_column.parquet has 3 columns: INT32, BYTE_ARRAY/String, INT64
+        let file = get_fixture_file("multi_column.parquet");
+        let schema = get_parquet_schema(file).unwrap();
+        assert_eq!(schema.len(), 3);
+        assert_eq!(schema[0].0, "id");
+        assert_eq!(schema[0].1, "INT32");
+        assert_eq!(schema[1].0, "name");
+        assert_eq!(schema[1].1, "BYTE_ARRAY");
+        // name column should have String/UTF8 logical type
+        assert!(!schema[1].2.is_empty(), "String column should have a logical type");
+        assert_eq!(schema[2].0, "score");
+        assert_eq!(schema[2].1, "INT64");
+    }
+
+    #[test]
+    fn test_schema_libero_fixture() {
+        // libero_fixture.parquet has struct<bytes,path>, list<float32> state, list<float32> action, int64, int64
+        let file = get_fixture_file("libero_fixture.parquet");
+        let schema = get_parquet_schema(file).unwrap();
+        // 6 physical leaf columns (paths use full nested dot-separated names):
+        assert_eq!(schema.len(), 6);
+
+        // col 0 — bytes child of image struct, BYTE_ARRAY, binary (no logical type)
+        assert!(schema[0].0.ends_with(".bytes") || schema[0].0 == "bytes",
+            "col 0 path should end with '.bytes': {}", schema[0].0);
+        assert_eq!(schema[0].1, "BYTE_ARRAY");
+        assert!(schema[0].2.is_empty(), "binary column should have no logical type");
+
+        // col 1 — path child of image struct, BYTE_ARRAY with String logical type
+        assert!(schema[1].0.ends_with(".path") || schema[1].0 == "path",
+            "col 1 path should end with '.path': {}", schema[1].0);
+        assert_eq!(schema[1].1, "BYTE_ARRAY");
+        assert!(!schema[1].2.is_empty(), "String column should have a logical type");
+
+        // col 2 — state list element, FLOAT
+        assert!(schema[2].0.contains("state"), "col 2 path should contain 'state': {}", schema[2].0);
+        assert_eq!(schema[2].1, "FLOAT");
+
+        // col 3 — action list element, FLOAT
+        assert!(schema[3].0.contains("action"), "col 3 path should contain 'action': {}", schema[3].0);
+        assert_eq!(schema[3].1, "FLOAT");
+
+        // frame_index — INT64
+        assert_eq!(schema[4].0, "frame_index");
+        assert_eq!(schema[4].1, "INT64");
+
+        // episode_index — INT64
+        assert_eq!(schema[5].0, "episode_index");
+        assert_eq!(schema[5].1, "INT64");
+    }
+
+    #[test]
+    fn test_schema_upstream_fixture() {
+        // alltypes_tiny_pages_plain.parquet should have multiple columns with various types
+        let file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let schema = get_parquet_schema(file).unwrap();
+        // Should have at least 10 columns
+        assert!(schema.len() >= 10, "Expected at least 10 columns, got {}", schema.len());
+        // First column should be id (INT32)
+        assert_eq!(schema[0].0, "id");
+        assert_eq!(schema[0].1, "INT32");
     }
 }
