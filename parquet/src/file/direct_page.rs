@@ -1143,6 +1143,68 @@ pub fn get_row_group_metadata(file: File) -> Result<Vec<(i64, bool)>> {
     Ok(result)
 }
 
+/// Reads specified columns from a Parquet file and returns them as Arrow arrays.
+///
+/// Designed for reading small metadata files (e.g., episode metadata) where
+/// full-file reads are appropriate. Uses the Arrow record batch reader internally.
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+/// * `column_names` - Names of the columns to read (supports nested paths like "data/file_index").
+///
+/// # Returns
+/// A vector of `(column_name, array)` pairs, one per requested column.
+/// Supported types: INT64, FLOAT, DOUBLE, STRING, and other types handled by the Arrow reader.
+pub fn read_parquet_columns(
+    file: File,
+    column_names: &[&str],
+) -> Result<Vec<(String, Arc<dyn Array>)>> {
+    use crate::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use crate::arrow::ProjectionMask;
+    use arrow_array::RecordBatchReader;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let schema_descr = builder.metadata().file_metadata().schema_descr().clone();
+
+    let mask = ProjectionMask::columns(&schema_descr, column_names.iter().copied());
+    let reader = builder.with_projection(mask).build()?;
+
+    let arrow_schema: Arc<arrow_schema::Schema> = reader.schema();
+
+    // Collect all record batches
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for batch_result in reader {
+        batches.push(batch_result?);
+    }
+
+    // Build result: for each requested column, concatenate arrays across batches
+    let mut result = Vec::with_capacity(arrow_schema.fields().len());
+    for (field_idx, field) in arrow_schema.fields().iter().enumerate() {
+        let arrays: Vec<Arc<dyn Array>> = batches
+            .iter()
+            .map(|b| b.column(field_idx).clone())
+            .collect();
+
+        let concatenated = if arrays.len() == 1 {
+            arrays.into_iter().next().unwrap()
+        } else if arrays.is_empty() {
+            return Err(ParquetError::General(format!(
+                "No data found for column '{}'",
+                field.name()
+            )));
+        } else {
+            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+            arrow_select::concat::concat(&refs).map_err(|e| {
+                ParquetError::General(format!("Failed to concatenate column '{}': {}", field.name(), e))
+            })?
+        };
+
+        result.push((field.name().clone(), concatenated));
+    }
+
+    Ok(result)
+}
+
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
 #[allow(clippy::too_many_arguments)]
@@ -1233,7 +1295,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_parquet_columns, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -3015,5 +3077,85 @@ mod tests {
         for (i, (num_rows, _has_oi)) in metadata.iter().enumerate() {
             assert!(*num_rows > 0, "RG{} should have positive row count", i);
         }
+    }
+
+    // --- read_parquet_columns tests ---
+
+    #[test]
+    fn test_read_parquet_columns_multi_column_fixture() {
+        // multi_column.parquet has: id (INT32), name (String), score (INT64)
+        let file = get_fixture_file("multi_column.parquet");
+        let columns = read_parquet_columns(file, &["id", "score"]).unwrap();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].0, "id");
+        assert_eq!(columns[1].0, "score");
+
+        // 2 row groups x 2000 rows = 4000 total
+        assert_eq!(columns[0].1.len(), 4000);
+        assert_eq!(columns[1].1.len(), 4000);
+
+        // Verify data: id = row_idx, score = row_idx * 100
+        let id_arr = columns[0].1.as_any().downcast_ref::<arrow_array::Int32Array>().unwrap();
+        let score_arr = columns[1].1.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(id_arr.value(0), 0);
+        assert_eq!(score_arr.value(0), 0);
+        assert_eq!(id_arr.value(1), 1);
+        assert_eq!(score_arr.value(1), 100);
+        // Data is continuous across RGs: 0..3999
+        assert_eq!(id_arr.value(2000), 2000); // first row of RG2
+        assert_eq!(score_arr.value(2000), 2000 * 100);
+    }
+
+    #[test]
+    fn test_read_parquet_columns_string_column() {
+        // Read the string column from multi_column fixture
+        let file = get_fixture_file("multi_column.parquet");
+        let columns = read_parquet_columns(file, &["name"]).unwrap();
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].0, "name");
+        assert_eq!(columns[0].1.len(), 4000);
+
+        let name_arr = columns[0].1.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+        assert_eq!(name_arr.value(0), "item_000000");
+        assert_eq!(name_arr.value(42), "item_000042");
+    }
+
+    #[test]
+    fn test_read_parquet_columns_libero_episode_metadata() {
+        // Reads the episode metadata fixture — the primary use case
+        let file = get_fixture_file("libero_episode_metadata.parquet");
+        let columns = read_parquet_columns(
+            file,
+            &["episode_index", "data/file_index", "dataset_from_index", "dataset_to_index", "length"],
+        ).unwrap();
+
+        assert_eq!(columns.len(), 5);
+        assert_eq!(columns[0].0, "episode_index");
+        assert_eq!(columns[1].0, "data/file_index");
+        assert_eq!(columns[2].0, "dataset_from_index");
+        assert_eq!(columns[3].0, "dataset_to_index");
+        assert_eq!(columns[4].0, "length");
+
+        // 2 episodes in the fixture
+        assert_eq!(columns[0].1.len(), 2);
+
+        let ep_idx = columns[0].1.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        let length = columns[4].1.as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(ep_idx.value(0), 0);
+        assert_eq!(ep_idx.value(1), 1);
+        assert_eq!(length.value(0), 50);
+        assert_eq!(length.value(1), 50);
+    }
+
+    #[test]
+    fn test_read_parquet_columns_all_columns() {
+        // Read all 3 columns from multi_column fixture
+        let file = get_fixture_file("multi_column.parquet");
+        let columns = read_parquet_columns(file, &["id", "name", "score"]).unwrap();
+        assert_eq!(columns.len(), 3);
+        // Verify all 3 have same length
+        assert!(columns.iter().all(|(_, arr)| arr.len() == 4000));
     }
 }
