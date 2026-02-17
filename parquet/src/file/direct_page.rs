@@ -1111,6 +1111,38 @@ pub fn get_parquet_schema(file: File) -> Result<Vec<(String, String, String)>> {
     Ok(columns)
 }
 
+/// Returns metadata for each row group in a Parquet file.
+///
+/// Each entry is a tuple of `(num_rows, has_offset_index)` where:
+/// - `num_rows` is the number of rows in that row group
+/// - `has_offset_index` indicates whether offset indexes are present for that row group
+///
+/// # Arguments
+/// * `file` - An open file handle for the Parquet file.
+pub fn get_row_group_metadata(file: File) -> Result<Vec<(i64, bool)>> {
+    let file_clone = file.try_clone().unwrap();
+    let file_reader = SerializedFileReader::new(file_clone)?;
+    let metadata = file_reader.metadata();
+    let num_row_groups = metadata.num_row_groups();
+    let mut result = Vec::with_capacity(num_row_groups);
+
+    for rg_idx in 0..num_row_groups {
+        let rg_meta = metadata.row_group(rg_idx);
+        let num_rows = rg_meta.num_rows();
+
+        // Check if offset indexes are present by trying to read them
+        #[allow(deprecated)]
+        let has_offset_index = match read_offset_indexes(&file, rg_meta.columns()) {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+
+        result.push((num_rows, has_offset_index));
+    }
+
+    Ok(result)
+}
+
 /// Reads rows in `[row_start, row_end)` from a single column by finding the overlapping
 /// pages and slicing appropriately.
 #[allow(clippy::too_many_arguments)]
@@ -1201,7 +1233,7 @@ mod tests {
     use arrow_cast::pretty::print_batches;
 
     use crate::basic::PageType;
-    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
+    use crate::file::direct_page::{generate_random_page_indices_dataset_level, generate_random_page_indices_file_level, generate_shuffled_multi_column_indices_file_level, generate_shuffled_multi_column_indices_dataset_level, get_file_page_locations, get_io_stats, get_page_by_idx, get_page_by_location, get_parquet_schema, get_row_group_metadata, read_multi_column_aligned, read_multi_column_row_range, read_page_into_batch, read_page_with_row_count, read_record_from_page, read_record_from_page_string, read_row_range, read_single_row};
     use crate::file::reader::{FileReader, SerializedFileReader};
     use crate::util::test_common::file_util::get_test_file;
 
@@ -2947,5 +2979,41 @@ mod tests {
         // First column should be id (INT32)
         assert_eq!(schema[0].0, "id");
         assert_eq!(schema[0].1, "INT32");
+    }
+
+    #[test]
+    fn test_row_group_metadata_multi_column_fixture() {
+        // multi_column.parquet has 2 row groups x 2000 rows, with offset indexes
+        let file = get_fixture_file("multi_column.parquet");
+        let metadata = get_row_group_metadata(file).unwrap();
+        assert_eq!(metadata.len(), 2, "Expected 2 row groups");
+        assert_eq!(metadata[0].0, 2000, "RG0 should have 2000 rows");
+        assert_eq!(metadata[1].0, 2000, "RG1 should have 2000 rows");
+        assert!(metadata[0].1, "RG0 should have offset indexes");
+        assert!(metadata[1].1, "RG1 should have offset indexes");
+    }
+
+    #[test]
+    fn test_row_group_metadata_libero_fixture() {
+        // libero_fixture.parquet has 2 row groups x 50 rows, with offset indexes
+        let file = get_fixture_file("libero_fixture.parquet");
+        let metadata = get_row_group_metadata(file).unwrap();
+        assert_eq!(metadata.len(), 2, "Expected 2 row groups");
+        assert_eq!(metadata[0].0, 50, "RG0 should have 50 rows");
+        assert_eq!(metadata[1].0, 50, "RG1 should have 50 rows");
+        assert!(metadata[0].1, "RG0 should have offset indexes");
+        assert!(metadata[1].1, "RG1 should have offset indexes");
+    }
+
+    #[test]
+    fn test_row_group_metadata_upstream_fixture() {
+        // alltypes_tiny_pages_plain.parquet — verify it has row groups with offset indexes
+        let file = get_test_file("alltypes_tiny_pages_plain.parquet");
+        let metadata = get_row_group_metadata(file).unwrap();
+        assert!(!metadata.is_empty(), "Should have at least one row group");
+        // All row groups should have positive row counts
+        for (i, (num_rows, _has_oi)) in metadata.iter().enumerate() {
+            assert!(*num_rows > 0, "RG{} should have positive row count", i);
+        }
     }
 }
