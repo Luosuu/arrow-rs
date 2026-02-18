@@ -57,7 +57,7 @@ use crate::errors::{ParquetError, Result};
 use crate::file::metadata::ColumnChunkMetaData;
 use crate::file::metadata::thrift::PageHeader;
 use crate::file::page_index::index_reader::read_offset_indexes;
-use crate::file::page_index::offset_index::PageLocation;
+use crate::file::page_index::offset_index::{OffsetIndexMetaData, PageLocation};
 use crate::file::properties::ReaderProperties;
 use crate::file::reader::*;
 use crate::file::serialized_reader::decode_page;
@@ -76,6 +76,9 @@ use crate::util::test_common::page_util::InMemoryPageReader;
 /// the underlying file handle from the cached reader.
 pub struct ParquetReaderCache {
     cache: HashMap<PathBuf, Arc<SerializedFileReader<File>>>,
+    /// Cached offset indexes per (file_path, row_group_idx).
+    /// Each entry contains the page locations for all columns in that row group.
+    offset_cache: HashMap<(PathBuf, usize), Vec<Vec<PageLocation>>>,
 }
 
 impl ParquetReaderCache {
@@ -83,6 +86,7 @@ impl ParquetReaderCache {
     pub fn new() -> Self {
         ParquetReaderCache {
             cache: HashMap::new(),
+            offset_cache: HashMap::new(),
         }
     }
 
@@ -103,9 +107,52 @@ impl ParquetReaderCache {
         Ok(reader)
     }
 
-    /// Releases all cached readers, freeing file handles and memory.
+    /// Returns cached offset indexes (page locations) for all columns in the given
+    /// row group. Reads from disk on first call and caches for subsequent calls.
+    ///
+    /// This avoids the expensive `read_offset_indexes` call on every read operation,
+    /// which is the dominant bottleneck for files with many row groups (e.g., 422 RGs).
+    pub fn get_offset_indexes(
+        &mut self,
+        path: &Path,
+        row_group_idx: usize,
+    ) -> Result<Vec<Vec<PageLocation>>> {
+        let key = (path.to_path_buf(), row_group_idx);
+        if let Some(offsets) = self.offset_cache.get(&key) {
+            return Ok(offsets.clone());
+        }
+
+        // Get the cached file reader (or open the file)
+        let file_reader = self.get_reader(path)?;
+
+        // Open a fresh file handle for I/O
+        let file = File::open(path).map_err(|e| {
+            ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
+        })?;
+
+        let row_group_reader = file_reader.get_row_group(row_group_idx)?;
+        #[allow(deprecated)]
+        let offset_indexes = read_offset_indexes(&file, row_group_reader.metadata().columns())?
+            .ok_or_else(|| {
+                ParquetError::General(
+                    "Offset index not available; file must be written with write_page_index=True"
+                        .to_string(),
+                )
+            })?;
+
+        let all_page_locations: Vec<Vec<PageLocation>> = offset_indexes
+            .into_iter()
+            .map(|idx| idx.page_locations().clone())
+            .collect();
+
+        self.offset_cache.insert(key, all_page_locations.clone());
+        Ok(all_page_locations)
+    }
+
+    /// Releases all cached readers and offset indexes, freeing file handles and memory.
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.offset_cache.clear();
     }
 
     /// Returns the number of files currently cached.
@@ -321,6 +368,164 @@ pub fn get_page_by_idx(
 
     let column_meta = row_group_reader.metadata().column(column_idx);
     get_page_by_location(file, page_location.clone(), column_meta)
+}
+
+/// Reads and decodes a page at a known location, using pre-parsed metadata.
+///
+/// Unlike `read_page_with_row_count` which creates a new `SerializedFileReader`
+/// and calls `get_page_by_idx` (both of which re-parse metadata), this function
+/// uses pre-computed `PageLocation` and `ColumnChunkMetaData` to read the page
+/// directly, making it suitable for cached read paths.
+fn read_page_at_location(
+    file: &File,
+    page_location: &PageLocation,
+    column_meta: &ColumnChunkMetaData,
+    column_desc: Arc<crate::schema::types::ColumnDescriptor>,
+) -> Result<(Arc<dyn Array>, usize)> {
+    let f = file.try_clone().unwrap();
+    let page = get_page_by_location(f, page_location.clone(), column_meta)?
+        .ok_or_else(|| {
+            ParquetError::General("Failed to read page at location".to_string())
+        })?;
+
+    let physical_type = column_desc.physical_type();
+    match physical_type {
+        PhysicalType::INT32 => {
+            let mut record_reader: GenericRecordReader<Vec<i32>, ColumnValueDecoderImpl<Int32Type>> =
+                RecordReader::<Int32Type>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Int32Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
+        PhysicalType::INT64 => {
+            let mut record_reader: GenericRecordReader<Vec<i64>, ColumnValueDecoderImpl<Int64Type>> =
+                RecordReader::<Int64Type>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Int64Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
+        PhysicalType::BYTE_ARRAY => {
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            let column_reader: ColumnReader = get_column_reader(column_desc.clone(), page_reader);
+            let mut typed_reader = get_typed_column_reader::<ByteArrayType>(column_reader);
+            let num_to_read = page.num_values() as usize;
+            let mut values = Vec::new();
+            let mut def_levels = Vec::new();
+            let mut rep_levels = Vec::new();
+            let (_, values_read, _) = typed_reader
+                .read_records(
+                    num_to_read,
+                    Some(&mut def_levels),
+                    Some(&mut rep_levels),
+                    &mut values,
+                )?;
+
+            let is_string = column_desc.converted_type() == ConvertedType::UTF8
+                || matches!(
+                    column_desc.logical_type_ref(),
+                    Some(crate::basic::LogicalType::String)
+                );
+
+            if is_string {
+                let str_values: Vec<Option<&str>> = values
+                    .iter()
+                    .map(|ba| Some(ba.as_utf8().unwrap()))
+                    .collect();
+                let array = GenericByteArray::<Utf8Type>::from(str_values);
+                Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+            } else {
+                let bin_values: Vec<Option<&[u8]>> = values
+                    .iter()
+                    .map(|ba| Some(ba.data()))
+                    .collect();
+                let array = arrow_array::BinaryArray::from(bin_values);
+                Ok((Arc::new(array) as Arc<dyn Array>, values_read))
+            }
+        }
+        PhysicalType::FLOAT => {
+            let mut record_reader: GenericRecordReader<Vec<f32>, ColumnValueDecoderImpl<FloatType>> =
+                RecordReader::<FloatType>::new(column_desc.clone());
+            let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+            record_reader.set_page_reader(page_reader)?;
+            let num_to_read = page.num_values() as usize;
+            let num_read = record_reader.read_records(num_to_read)?;
+            let data = record_reader.consume_record_data();
+            let array = arrow_array::Float32Array::from(data);
+            Ok((Arc::new(array) as Arc<dyn Array>, num_read))
+        }
+        _ => Err(ParquetError::General(format!(
+            "Unsupported physical type {:?} for read_page_at_location",
+            physical_type
+        ))),
+    }
+}
+
+/// Reads and decodes a LIST<FLOAT32> page at a known location, using pre-parsed metadata.
+///
+/// Like `read_page_at_location` but for list columns — reconstructs list boundaries
+/// from rep/def levels.
+fn read_list_page_at_location(
+    file: &File,
+    page_location: &PageLocation,
+    column_meta: &ColumnChunkMetaData,
+    column_desc: Arc<crate::schema::types::ColumnDescriptor>,
+) -> Result<(Arc<dyn Array>, usize)> {
+    let f = file.try_clone().unwrap();
+    let page = get_page_by_location(f, page_location.clone(), column_meta)?
+        .ok_or_else(|| {
+            ParquetError::General("Failed to read list page at location".to_string())
+        })?;
+
+    let mut record_reader: GenericRecordReader<Vec<f32>, ColumnValueDecoderImpl<FloatType>> =
+        RecordReader::<FloatType>::new(column_desc.clone());
+    let page_reader = Box::new(InMemoryPageReader::new(vec![page.clone()]));
+    record_reader.set_page_reader(page_reader)?;
+    let num_to_read = page.num_values() as usize;
+    record_reader.read_records(num_to_read)?;
+
+    let values = record_reader.consume_record_data();
+    let rep_levels = record_reader.consume_rep_levels();
+    let def_levels = record_reader.consume_def_levels();
+
+    let rep = rep_levels.unwrap_or_default();
+    let max_def_level = column_desc.max_def_level();
+
+    let mut offsets: Vec<i32> = Vec::new();
+    let mut cur_offset: i32 = 0;
+    let mut num_rows = 0;
+
+    if !rep.is_empty() {
+        for (i, &r) in rep.iter().enumerate() {
+            if r == 0 {
+                offsets.push(cur_offset);
+                num_rows += 1;
+            }
+            if let Some(ref dl) = def_levels {
+                if dl[i] == max_def_level {
+                    cur_offset += 1;
+                }
+            } else {
+                cur_offset += 1;
+            }
+        }
+    }
+    offsets.push(cur_offset);
+
+    let float_array = arrow_array::Float32Array::from(values);
+    let offsets_array = arrow_array::Int32Array::from(offsets);
+    let offsets_buffer = arrow_buffer::OffsetBuffer::new(offsets_array.into_parts().1);
+    let list_field = Arc::new(arrow_schema::Field::new("element", arrow_schema::DataType::Float32, true));
+    let list_array = arrow_array::ListArray::new(list_field, offsets_buffer, Arc::new(float_array), None);
+
+    Ok((Arc::new(list_array) as Arc<dyn Array>, num_rows))
 }
 
 /// Reads a page into a RecordBatch using the ByteArray decoder.
@@ -1031,11 +1236,14 @@ pub fn read_row_range_cached(
         )));
     }
 
-    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let all_page_locations = cache.get_offset_indexes(path, row_group_idx)?;
+    let file_reader = cache.get_reader(path)?;
     let file = File::open(path).map_err(|e| {
         ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
     })?;
-    read_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+    read_row_range_with_reader_and_offsets(
+        &file, row_group_idx, column_idx, start_row, end_row, &file_reader, &all_page_locations,
+    )
 }
 
 fn read_row_range_with_reader(
@@ -1082,6 +1290,82 @@ fn read_row_range_with_reader(
 
     let row_count = end_row - start_row;
     Ok((array, row_count))
+}
+
+/// Like `read_row_range_with_reader` but uses pre-computed offset indexes
+/// and pre-parsed metadata, avoiding all redundant file opens and metadata parsing.
+fn read_row_range_with_reader_and_offsets(
+    file: &File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+    all_page_locations: &[Vec<PageLocation>],
+) -> Result<(Arc<dyn Array>, usize)> {
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    if end_row > num_rows_in_rg {
+        return Err(ParquetError::General(format!(
+            "end_row ({}) exceeds row group size ({})",
+            end_row, num_rows_in_rg
+        )));
+    }
+
+    let col_pages = &all_page_locations[column_idx];
+    let column_meta = row_group_meta.column(column_idx);
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (p_idx, page_loc) in col_pages.iter().enumerate() {
+        let p_row_start = page_loc.first_row_index as usize;
+        let p_row_end = if p_idx + 1 < col_pages.len() {
+            col_pages[p_idx + 1].first_row_index as usize
+        } else {
+            num_rows_in_rg
+        };
+
+        if p_row_end <= start_row || p_row_start >= end_row {
+            continue;
+        }
+
+        let (page_array, _) = read_page_at_location(file, page_loc, column_meta, Arc::clone(&column_desc))?;
+
+        let slice_start = start_row.saturating_sub(p_row_start);
+        let slice_end = if end_row < p_row_end {
+            end_row - p_row_start
+        } else {
+            page_array.len()
+        };
+
+        let sliced = page_array.slice(slice_start, slice_end - slice_start);
+        arrays.push(sliced);
+    }
+
+    if arrays.is_empty() {
+        return Err(ParquetError::General(format!(
+            "No pages found for column {} covering rows [{}, {})",
+            column_idx, start_row, end_row
+        )));
+    }
+
+    let result = if arrays.len() == 1 {
+        arrays.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        arrow_select::concat::concat(&refs).map_err(|e| {
+            ParquetError::General(format!("Failed to concatenate arrays: {}", e))
+        })?
+    };
+
+    let row_count = end_row - start_row;
+    Ok((result, row_count))
 }
 
 /// Reads a range of rows from a LIST<FLOAT32> column in a row group, returning a
@@ -1138,11 +1422,14 @@ pub fn read_list_row_range_cached(
         )));
     }
 
-    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let all_page_locations = cache.get_offset_indexes(path, row_group_idx)?;
+    let file_reader = cache.get_reader(path)?;
     let file = File::open(path).map_err(|e| {
         ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
     })?;
-    read_list_row_range_with_reader(&file, row_group_idx, column_idx, start_row, end_row, &file_reader)
+    read_list_row_range_with_reader_and_offsets(
+        &file, row_group_idx, column_idx, start_row, end_row, &file_reader, &all_page_locations,
+    )
 }
 
 fn read_list_row_range_with_reader(
@@ -1197,6 +1484,82 @@ fn read_list_row_range_with_reader(
         let (page_array, page_num_rows) = read_list_float_page(f, row_group_idx, column_idx, p_idx)?;
 
         // Compute the slice within this page that overlaps with [start_row, end_row)
+        let slice_start = start_row.saturating_sub(p_row_start);
+        let slice_end = if end_row < p_row_end {
+            end_row - p_row_start
+        } else {
+            page_num_rows
+        };
+
+        let sliced = page_array.slice(slice_start, slice_end - slice_start);
+        arrays.push(sliced);
+    }
+
+    if arrays.is_empty() {
+        return Err(ParquetError::General(format!(
+            "No pages found for column {} covering rows [{}, {})",
+            column_idx, start_row, end_row
+        )));
+    }
+
+    let result = if arrays.len() == 1 {
+        arrays.into_iter().next().unwrap()
+    } else {
+        let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+        arrow_select::concat::concat(&refs).map_err(|e| {
+            ParquetError::General(format!("Failed to concatenate list arrays: {}", e))
+        })?
+    };
+
+    let row_count = end_row - start_row;
+    Ok((result, row_count))
+}
+
+/// Like `read_list_row_range_with_reader` but uses pre-computed offset indexes
+/// and pre-parsed metadata, avoiding all redundant file opens and metadata parsing.
+fn read_list_row_range_with_reader_and_offsets(
+    file: &File,
+    row_group_idx: usize,
+    column_idx: usize,
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+    all_page_locations: &[Vec<PageLocation>],
+) -> Result<(Arc<dyn Array>, usize)> {
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    if end_row > num_rows_in_rg {
+        return Err(ParquetError::General(format!(
+            "end_row ({}) exceeds row group size ({})",
+            end_row, num_rows_in_rg
+        )));
+    }
+
+    let col_pages = &all_page_locations[column_idx];
+    let column_meta = row_group_meta.column(column_idx);
+    let column_desc = parquet_metadata
+        .file_metadata()
+        .schema_descr_ptr()
+        .column(column_idx);
+
+    let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+    for (p_idx, page_loc) in col_pages.iter().enumerate() {
+        let p_row_start = page_loc.first_row_index as usize;
+        let p_row_end = if p_idx + 1 < col_pages.len() {
+            col_pages[p_idx + 1].first_row_index as usize
+        } else {
+            num_rows_in_rg
+        };
+
+        if p_row_end <= start_row || p_row_start >= end_row {
+            continue;
+        }
+
+        let (page_array, page_num_rows) = read_list_page_at_location(file, page_loc, column_meta, Arc::clone(&column_desc))?;
+
         let slice_start = start_row.saturating_sub(p_row_start);
         let slice_end = if end_row < p_row_end {
             end_row - p_row_start
@@ -1321,11 +1684,14 @@ pub fn read_multi_column_row_range_cached(
         )));
     }
 
-    let file_reader = get_or_open_reader(path, Some(cache))?;
+    let all_page_locations = cache.get_offset_indexes(path, row_group_idx)?;
+    let file_reader = cache.get_reader(path)?;
     let file = File::open(path).map_err(|e| {
         ParquetError::General(format!("Failed to open file {:?}: {}", path, e))
     })?;
-    read_multi_column_row_range_with_reader(&file, row_group_idx, column_indices, start_row, end_row, &file_reader)
+    read_multi_column_row_range_with_reader_and_offsets(
+        &file, row_group_idx, column_indices, start_row, end_row, &file_reader, &all_page_locations,
+    )
 }
 
 fn read_multi_column_row_range_with_reader(
@@ -1377,6 +1743,88 @@ fn read_multi_column_row_range_with_reader(
             num_rows_in_rg,
             parquet_metadata,
         )?;
+        results.push((array, row_count));
+    }
+
+    Ok(results)
+}
+
+/// Like `read_multi_column_row_range_with_reader` but uses pre-computed offset indexes
+/// and pre-parsed metadata, avoiding all redundant file opens and metadata parsing.
+fn read_multi_column_row_range_with_reader_and_offsets(
+    file: &File,
+    row_group_idx: usize,
+    column_indices: &[usize],
+    start_row: usize,
+    end_row: usize,
+    file_reader: &SerializedFileReader<File>,
+    all_page_locations: &[Vec<PageLocation>],
+) -> Result<Vec<(Arc<dyn Array>, usize)>> {
+    let parquet_metadata = file_reader.metadata();
+    let row_group_meta = parquet_metadata.row_group(row_group_idx);
+    let num_rows_in_rg = row_group_meta.num_rows() as usize;
+
+    if end_row > num_rows_in_rg {
+        return Err(ParquetError::General(format!(
+            "end_row ({}) exceeds row group size ({})",
+            end_row, num_rows_in_rg
+        )));
+    }
+
+    let row_count = end_row - start_row;
+    let mut results = Vec::with_capacity(column_indices.len());
+
+    for &col_idx in column_indices {
+        let col_pages = &all_page_locations[col_idx];
+        let column_meta = row_group_meta.column(col_idx);
+        let column_desc = parquet_metadata
+            .file_metadata()
+            .schema_descr_ptr()
+            .column(col_idx);
+
+        let mut arrays: Vec<Arc<dyn Array>> = Vec::new();
+
+        for (p_idx, page_loc) in col_pages.iter().enumerate() {
+            let p_row_start = page_loc.first_row_index as usize;
+            let p_row_end = if p_idx + 1 < col_pages.len() {
+                col_pages[p_idx + 1].first_row_index as usize
+            } else {
+                num_rows_in_rg
+            };
+
+            if p_row_end <= start_row || p_row_start >= end_row {
+                continue;
+            }
+
+            let (page_array, _) = read_page_at_location(file, page_loc, column_meta, Arc::clone(&column_desc))?;
+
+            let slice_start = start_row.saturating_sub(p_row_start);
+            let slice_end = if end_row < p_row_end {
+                end_row - p_row_start
+            } else {
+                page_array.len()
+            };
+
+            let sliced = page_array.slice(slice_start, slice_end - slice_start);
+            arrays.push(sliced);
+        }
+
+        if arrays.is_empty() {
+            return Err(ParquetError::General(format!(
+                "No pages found for column {} covering rows [{}, {})",
+                col_idx, start_row, end_row
+            )));
+        }
+
+        let array = if arrays.len() == 1 {
+            arrays.into_iter().next().unwrap()
+        } else {
+            let refs: Vec<&dyn Array> = arrays.iter().map(|a| a.as_ref()).collect();
+            arrow_select::concat::concat(&refs).map_err(|e| {
+                ParquetError::General(format!("Failed to concatenate arrays: {}", e))
+            })?
+        };
+
         results.push((array, row_count));
     }
 
